@@ -1,4 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
+// FILE: 17_anim_tools.js
+// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================
+// ═══════════════════════════════════════════════════════════════════════════
 // 17_anim_tools.js  —  MGS1 Animation Swapper
 // ═══════════════════════════════════════════════════════════════════════════
 // Self-contained module: KMD character parser, OAR parser/decoder/splicer,
@@ -455,18 +459,14 @@ function AT_padWithStubs(target, desiredCount){
     archive: newArch
   };
 }
-// ─── Archive compaction (garbage collect orphaned chunks) ──────────────────
-// Rebuilds the archive containing only chunks actually referenced by current
-// entries. Deduplicates identical chunks (e.g. shared stubs from AT_padWithStubs
-// won't be duplicated). Call before serializing to keep output file size sane
-// even after many swap operations.
-//
-// WHY THIS IS NEEDED: AT_spliceMotion is APPEND-ONLY — it copies the entire
-// old archive (including the old target motion bytes) then appends the new
-// donor motion at the end. The slot's offsets are updated to point at the
-// new location, but the old data stays in the archive as orphaned bytes.
-// Without compaction, every swap grows the file by the donor motion's size
-// regardless of whether donor is shorter or longer than the target it replaced.
+// Garbage-collect orphaned bitstream bytes left over from prior swap
+// operations. Without this, every swap/edit appends new chunks to the
+// archive but never reclaims the data the old chunks pointed at, so the
+// archive grows unboundedly. AT_compactArchive walks every motion's
+// current chunks, deduplicates by content (so identical stubs from
+// AT_padWithStubs collapse to one copy), and returns a fresh OAR with
+// the same logical data but a minimal archive. The dedup also catches
+// any motions that happen to share identical bone streams.
 function AT_compactArchive(oar){
   var newArchList = [];           // array of u16 values, becomes archive
   var chunkOffsetMap = new Map(); // "u16,u16,..." → offset in newArchList
@@ -824,7 +824,6 @@ function AT_freezeFrame(oar, motionIdx, sourceFrame){
   }
   return AT_replaceMotionAtIndex(oar, motionIdx, 1, newMoveChunk, newRotChunks);
 }
-
 
 function AT_speedMotion(oar, motionIdx, factor){
   if(factor <= 0) throw new Error("Speed factor must be positive");
@@ -1381,6 +1380,8 @@ function openAnimSwapper(){
     '<div style="padding:8px 12px;border-bottom:1px solid #1a2535;display:flex;align-items:center;justify-content:space-between;background:#0d1219">'+
       '<div style="font-size:13px;font-weight:bold;color:#7cf">🎬 Animation Swapper</div>'+
       '<div style="display:flex;gap:6px;align-items:center">'+
+        '<button id="atMeleeBtn" class="btn" style="font-size:11px;padding:4px 10px;background:#3a2416;color:#ff9a66;border-color:#5c3a24" title="Open the Melee Hitbox Editor — edit hit placement/size/damage and hit FRAMES directly in a compiled PS-X EXE (load the EXE there)">🥋 Hitboxes / Frames</button>'+
+        '<div style="width:1px;height:18px;background:#1a2535;margin:0 4px"></div>'+
         '<button id="atUndoBtn" class="btn" style="font-size:11px;padding:4px 10px;background:#1a2a3a;color:#cde" title="Nothing to undo" disabled>↶ Undo</button>'+
         '<button id="atRedoBtn" class="btn" style="font-size:11px;padding:4px 10px;background:#1a2a3a;color:#cde" title="Nothing to redo" disabled>↷ Redo</button>'+
         '<div style="width:1px;height:18px;background:#1a2535;margin:0 4px"></div>'+
@@ -1584,6 +1585,10 @@ function openAnimSwapper(){
   document.getElementById('atLoopBtn').onclick=AT_performLoop;
   document.getElementById('atRevertBtn').onclick=AT_performRevert;
   document.getElementById('atUndoBtn').onclick=AT_performUndo;
+  document.getElementById('atMeleeBtn').onclick=function(){
+    if(typeof openMeleeEditor==='function') openMeleeEditor();
+    else alert('Melee Hitbox Editor module not loaded in this build.');
+  };
   document.getElementById('atRedoBtn').onclick=AT_performRedo;
   document.getElementById('atQueueAddTargetBtn').onclick=function(){ AT_queueAdd('target'); };
   document.getElementById('atQueueAddDonorBtn').onclick=function(){ AT_queueAdd('donor'); };
@@ -3054,3 +3059,5 @@ AT_applyRestPose=function(){
     AT_state.skeletonHelper.userData.updateFn();
   }
 };
+
+// ============================================================

@@ -1,0 +1,251 @@
+{
+ "head": "template/head.html",
+ "tail": "template/tail.html",
+ "blocks": [
+  {
+   "file": "vendor/three.js",
+   "kind": "vendor",
+   "sep_after": "\n"
+  },
+  {
+   "file": "vendor/three_loaders.js",
+   "kind": "vendor",
+   "sep_after": "\n"
+  },
+  {
+   "file": "vendor/jszip.js",
+   "kind": "vendor",
+   "sep_after": "\n"
+  },
+  {
+   "file": "vendor/separator_03.js",
+   "kind": "vendor",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/00_core.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/01_gcl.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/02_3d.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/03_ui.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/04_textures.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/04a_dropscreen_bg.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/05_main.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/06_gcl_viewer.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/07_route_editor.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/08_hzm_inspector.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/09_event_tracing.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/10_vram_analysis.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/10b_clut_inspector.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/11_vram_repacker.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/12_entity_templates.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/13_spawn_wizard.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/14_door_analyzer.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/15_door_wizard.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/16_dropscreen_bg.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/17_anim_tools.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/18_char_builder.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/18_sound_tools.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/19_gcl_flowchart.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/19_psx_textures.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/19_textures.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/20_gcx_disassemble.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/21_gcx_assemble.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/22_gcx_mutate.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/23_gcx_viewer.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/24_gcx_charalst.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/25_gcx_entities.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/26_gcx_psx_pipeline.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/27_gcx_text_view.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/28_gcx_text_compiler.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/29_stagedir.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/30_wvx_viewer.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/31_se_editor.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/32_efx_editor.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/33_codec_editor.js",
+   "kind": "app",
+   "sep_after": ""
+  },
+  {
+   "file": "src/34_rpk_studio.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/35_lit_editor.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/36_lit_3d.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/37_melee_editor.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/38_attribute_changer.js",
+   "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/39_archive_tool.js",
+   "kind": "app",
+   "sep_after": ""
+  }
+ ]
+}
