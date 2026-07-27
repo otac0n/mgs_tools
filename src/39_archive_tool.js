@@ -17,12 +17,18 @@ var ARCHIVE_TOOL_HTML=`
   WHAT IT DOES
     EXTRACT: drop a PSX STAGE.DIR or a PC stage.mgz.
       · PSX: every stage becomes a named folder; entries are written as
-        NNN_hash.ext; every .dar inside is further unpacked into
-        NNN_hash.dar_unpacked/ folders ({u16 hash,u16 ext,u32 size} entries).
+        their ORIGINAL names — hash.ext, e.g. 39213.kmd — so external tools
+        like MetalMintSolid find the names they expect; every .dar inside is
+        further unpacked into hash.dar_unpacked/ folders (members also named
+        hash.ext). Rare same-name duplicates get __2/__3 suffixes. Order and
+        structure live in _archive_manifest.json — KEEP IT with the files.
       · PC: the ZIP layout is preserved; every .dar is unpacked into
         <name>.dar_unpacked/ folders (named-entry PC format); every .gcx is
         DECOMPILED to an editable .gcl next to where the .gcx was.
       Output: <name>_extracted.zip containing everything + _archive_manifest.json.
+      On repack: edited files are picked up; files you DELETE are removed from
+      the rebuilt archive (logged); new files named HASH.EXT dropped into a
+      stage folder or a *_unpacked DAR folder are ADDED (logged).
 
     REPACK: drop the extracted ZIP (or the loose extracted FOLDER) back.
       Everything is rebuilt bottom-up — inner DARs first, then stages, then
@@ -104,8 +110,10 @@ var ARCHIVE_TOOL_HTML=`
   <span class="sub">stage.dir (PSX) · stage.mgz (PC) · unpack ⇄ repack</span>
   <span class="spacer"></span>
   <button class="btn" id="pick">Load file</button>
+  <button class="btn" id="pickDir" title="Repack a loose extracted folder (reliable alternative to dragging the folder in)">Load folder</button>
   <button class="btn" id="hostExit" style="background:#c26;display:none">✕ Exit</button>
   <input type="file" id="fileIn" hidden>
+  <input type="file" id="dirIn" webkitdirectory directory multiple hidden>
 </header>
 <main>
   <div class="drop" id="drop">
@@ -2000,8 +2008,7 @@ function gcxAstToGCL(gcx){
 }
 
 <\/script>
-<script>
-// ═══════════════════════════════════════════════════════════════════════════
+<script>// ═══════════════════════════════════════════════════════════════════════════
 // MGS1 Archive Tool — core engine (browser + Node)
 // stage.dir (PSX) / stage.mgz (PC) full unpack ⇄ repack.
 // Formats ported from the MGS Stage Editor suite (29_stagedir.js) and the
@@ -2100,13 +2107,24 @@ function psxParseStage(sb){
 function psxRebuildStage(headerB64, entries){
   var header=bytesFromB64(headerB64).slice();
   var n=entries.length, sf=new Array(n), cum=0, i;
+  if(4+(n+1)*8>2048) throw new Error("stage config table overflow ("+n+" entries; max 254)");
   for(i=0;i<n;i++){
     var e=entries[i];
     if(e.ext===0xff) sf[i]=cum;
     else if(e.mode===0x63){ sf[i]=cum; cum+=e.bytes.length; }
     else sf[i]=e.bytes.length;
   }
-  for(i=0;i<n;i++) w32(header,4+i*8+4,sf[i]);
+  // measure the ORIGINAL config table extent so removals leave no stale records
+  var oldEnd=4;
+  while(oldEnd+8<=2048 && header[oldEnd+2]!==0) oldEnd+=8;
+  oldEnd+=8;                                  // include the old terminator record
+  // rewrite the WHOLE table: entry counts can change (additions/deletions)
+  for(i=0;i<n;i++){
+    var o=4+i*8, e1=entries[i];
+    w16(header,o,e1.hash); header[o+2]=e1.mode; header[o+3]=e1.ext;
+    w32(header,o+4,sf[i]);
+  }
+  for(i=4+n*8;i<Math.max(oldEnd,4+(n+1)*8)&&i<2048;i++) header[i]=0;   // terminator + clear stale tail
   var chunks=[], pos=2048;
   function pad(){ var q=(2048-(pos&0x7ff))&0x7ff; if(q){chunks.push(new Uint8Array(q)); pos+=q;} }
   for(i=0;i<n;i++){
@@ -2159,11 +2177,20 @@ function psxDarParse(d){
   return (p===d.length && out.length>0) ? out : null;
 }
 function psxDarBuild(items /* [{hash,ext,bytes}] */){
+  // Payloads are padded to a 4-byte boundary and the STORED size is the
+  // padded size — matching vanilla Konami packing. The engine computes the
+  // next member header as cur+8+storedSize; an unaligned size makes that a
+  // misaligned MIPS word load, which crashes emulators in interpreter mode
+  // (mobile cores). Exact-size members from older builds are what the
+  // community STAGE.DIR alignment fixer repairs; building aligned makes the
+  // fixer a no-op on our output.
   var chunks=[];
   items.forEach(function(it){
+    var pad=(4-(it.bytes.length&3))&3;
     var h=new Uint8Array(8);
-    w16(h,0,it.hash); w16(h,2,it.ext); w32(h,4,it.bytes.length);
+    w16(h,0,it.hash); w16(h,2,it.ext); w32(h,4,it.bytes.length+pad);
     chunks.push(h,it.bytes);
+    if(pad) chunks.push(new Uint8Array(pad));
   });
   return concat(chunks);
 }
@@ -2217,10 +2244,8 @@ var api={ u16:u16,u32:u32,w16:w16,w32:w32,concat:concat,
 if(typeof module!=="undefined"&&module.exports) module.exports=api;
 else for(var k in api) global[k]=api[k];
 })(typeof window!=="undefined"?window:this);
-
 <\/script>
-<script>
-// ═══════════════════════════════════════════════════════════════════════════
+<script>// ═══════════════════════════════════════════════════════════════════════════
 // VRAM repack pass — standalone port of the suite's v82 repacker
 // (10_vram_analysis.js + 11_vram_repacker.js), adapted for the archive tool:
 // "imported" ⇒ "changed or newly added since extract" (manifest checksums).
@@ -2286,8 +2311,11 @@ function texRect(s){return {x:s.px,y:s.py,w:s.vw,h:s.h};}
 function homeRegion(py){return py<256?"init":"stage";}
 
 function findFreeTexSlot(region,occupied,cluts,vw,h,bpp){
+  // x steps by 1: retail packs place textures at arbitrary halfword x
+  // (794, 807, 843... in the shipped init), so a coarser grid forfeits
+  // real space. 4bpp pixel offsets stay valid at any halfword x.
   for(var y=region.y1;y+h<=region.y2;y++){
-    for(var x=region.x1;x+vw<=region.x2;x+=4){
+    for(var x=region.x1;x+vw<=region.x2;x++){
       if(crossesTPage(x,vw,bpp))continue;
       var cand={x:x,y:y,w:vw,h:h}, ok=true, i;
       for(i=0;i<occupied.length;i++)if(rectsOverlap(cand,texRect(occupied[i]))){ok=false;break;}
@@ -2402,14 +2430,12 @@ function vramRepackFiles(files){
 var api={vramCrc32:crc32,vramSlotOf:vramSlotOf,vramRepackFiles:vramRepackFiles,
   writePlacement:writePlacement,rectsOverlap:rectsOverlap,clutsOverlap:clutsOverlap,
   crossesTPage:crossesTPage,texRect:texRect,findFreeTexSlot:findFreeTexSlot,
-  findFreeClutSlot:findFreeClutSlot};
+  findFreeClutSlot:findFreeClutSlot,VRAM_REGIONS:VRAM_REGIONS};
 if(typeof module!=="undefined"&&module.exports)module.exports=api;
 else for(var k in api)global[k]=api[k];
 })(typeof window!=="undefined"?window:this);
-
 <\/script>
-<script>
-// ═══════════════════════════════════════════════════════════════════════════
+<script>// ═══════════════════════════════════════════════════════════════════════════
 // MGS1 Archive Tool — application layer
 // ═══════════════════════════════════════════════════════════════════════════
 (function(){
@@ -2439,17 +2465,30 @@ function extractPSX(dirBytes, origName){
     var parsed=psxParseStage(dirBytes.subarray(st.byteOff, st.byteOff+st.extent));
     var m={name:st.name, nameB64:st.nameB64, sector:st.sector,
       headerB64:parsed.headerB64, entries:[]};
+    // ORIGINAL-NAME dump: files are named exactly <hash>.<ext> (decimal hash,
+    // e.g. 39213.kmd) so external tools like MetalMintSolid find the names
+    // they expect. Order and structure live in the manifest, not in filenames.
+    // Rare duplicate (hash,ext) pairs in the same folder get __2/__3 suffixes,
+    // recorded in the manifest so repack stays exact.
+    var takenTop={};
+    function pickName(taken,hash,extStr){
+      var name=hash+"."+extStr, n=1;
+      while(taken[name]){ n++; name=hash+"__"+n+"."+extStr; }
+      taken[name]=1; return name;
+    }
     parsed.entries.forEach(function(e,i){
-      var base=String(i).padStart(3,"0")+"_"+e.hash+"."+extName(e.ext);
-      var me={idx:i,hash:e.hash,mode:e.mode,ext:e.ext,name:base};
-      if(e.ext===0xff){ me.marker=true; m.entries.push(me); return; }
+      var me={idx:i,hash:e.hash,mode:e.mode,ext:e.ext};
+      if(e.ext===0xff){ me.marker=true; me.name=e.hash+".marker"; m.entries.push(me); return; }
+      var base=pickName(takenTop,e.hash,extName(e.ext));
+      me.name=base;
       var darItems=(extName(e.ext)==="dar")? psxDarParse(e.data): null;
       if(darItems){
         me.isDar=true;
-        me.dar=darItems.map(function(d,j){return {idx:j,hash:d.hash,ext:d.ext,crc:vramCrc32(d.data)};});
-        darItems.forEach(function(d,j){
-          zip.file(st.name+"/"+base+"_unpacked/"+String(j).padStart(3,"0")+"_"+d.hash+"."+extName(d.ext&255), d.data);
-          nFiles++;
+        var takenDar={};
+        me.dar=darItems.map(function(d,j){
+          var dn=pickName(takenDar,d.hash,extName(d.ext&255));
+          zip.file(st.name+"/"+base+"_unpacked/"+dn, d.data); nFiles++;
+          return {idx:j,hash:d.hash,ext:d.ext,crc:vramCrc32(d.data),name:dn};
         });
         nDars++;
       } else {
@@ -2461,6 +2500,17 @@ function extractPSX(dirBytes, origName){
     log("  "+st.name+": "+m.entries.length+" entries");
   });
   zip.file(MANIFEST, JSON.stringify(manifest));
+  // Header sidecar: the manifest already holds all base64 headers, but we also
+  // drop a compact self-describing copy so a plain-FOLDER repack (no manifest
+  // present, or manifest reconstructed from names) can still recover the
+  // binary headers that cannot be synthesized from files alone.
+  zip.file("_archive_headers.bin", JSON.stringify({
+    v:1, platform:"psx", filename:manifest.filename,
+    headB64:outer.headB64,
+    stages:manifest.psx.stages.map(function(s){
+      return {name:s.name, nameB64:s.nameB64, sector:s.sector, headerB64:s.headerB64};
+    })
+  }));
   log("PSX extract: "+outer.stages.length+" stages, "+nFiles+" files ("+nDars+" DARs unpacked)","ok");
   return zip.generateAsync({type:"uint8array",compression:"DEFLATE"}).then(function(u8){
     dl(u8,(origName||"STAGE.DIR").replace(/\\.[^.]*$/,"")+"_extracted.zip");
@@ -2540,8 +2590,8 @@ function psxExtraItems(fileMap, folderPrefix, known){
     var base=p.substring(folderPrefix.length);
     if(base.indexOf("/")>=0) return;
     if(known[base]) return;
-    var mm=base.match(/_(\\d+)\\.([a-z0-9]+)$/i);
-    if(!mm){ log("  ! extra file '"+base+"' ignored (name must end _HASH.EXT)","warn"); return; }
+    var mm=base.match(/^(?:\\d{1,3}_)?(\\d+)(?:__\\d+)?\\.([a-z0-9]+)$/i);
+    if(!mm){ log("  ! extra file '"+base+"' ignored (name it HASH.EXT, e.g. 39213.kmd)","warn"); return; }
     var extByte=0; for(var b in EXT_REV) if(EXT_REV[b]===mm[2].toLowerCase()){ extByte=+b; break; }
     extras.push({hash:+mm[1], ext:extByte, bytes:fileMap[p], name:base});
   });
@@ -2570,37 +2620,74 @@ function vramPass(label, files){
 }
 
 function repackPSX(manifest,fileMap){
-  var missing=[];
+  var removed=0, added=0;
   var blobs={};
   manifest.psx.stages.forEach(function(m){
-    var entries=m.entries.map(function(me){
-      if(me.marker) return {hash:me.hash,mode:me.mode,ext:me.ext,bytes:new Uint8Array(0)};
+    var manifestNames={};                    // top-level names claimed by the manifest
+    var entries=[];
+    m.entries.forEach(function(me){
+      if(me.marker){ entries.push({hash:me.hash,mode:me.mode,ext:me.ext,bytes:new Uint8Array(0),marker:true}); return; }
+      manifestNames[me.name]=1;
       if(me.isDar){
         var folder=m.name+"/"+me.name+"_unpacked/";
         var known={};
-        var items=me.dar.map(function(d){
-          var base=String(d.idx).padStart(3,"0")+"_"+d.hash+"."+extName(d.ext&255);
+        var items=[];
+        me.dar.forEach(function(d){
+          // manifest name (original-style) with legacy NNN_ fallback for old dumps
+          var base=d.name || (String(d.idx).padStart(3,"0")+"_"+d.hash+"."+extName(d.ext&255));
           known[base]=1;
           var bytes=fileMap[folder+base];
-          if(!bytes){ missing.push(folder+base); bytes=new Uint8Array(0); }
-          return {hash:d.hash,ext:d.ext,bytes:bytes,name:base,
-                  changed:(d.crc!==undefined)&&vramCrc32(bytes)!==d.crc};
+          if(!bytes){
+            log("  \\u2212 removed from "+me.name+" (file absent): "+base,"warn"); removed++;
+            return;                          // DELETED member: drop it
+          }
+          items.push({hash:d.hash,ext:d.ext,bytes:bytes,name:base,
+                      changed:(d.crc!==undefined)&&vramCrc32(bytes)!==d.crc});
         });
         psxExtraItems(fileMap,folder,known).forEach(function(x){
           x.changed=true;                            // new file = mobile
-          items.push(x); log("  + added to "+me.name+": "+x.name,"ok");
+          items.push(x); log("  + added to "+me.name+": "+x.name,"ok"); added++;
         });
         vramPass(m.name+"/"+me.name,
           items.map(function(it){return {name:it.name,data:it.bytes,changed:it.changed};}));
-        return {hash:me.hash,mode:me.mode,ext:me.ext,bytes:psxDarBuild(items)};
+        entries.push({hash:me.hash,mode:me.mode,ext:me.ext,bytes:psxDarBuild(items)});
+        return;
       }
       var bytes=fileMap[m.name+"/"+me.name];
-      if(!bytes){ missing.push(m.name+"/"+me.name); bytes=new Uint8Array(0); }
-      return {hash:me.hash,mode:me.mode,ext:me.ext,bytes:bytes};
+      if(!bytes){
+        log("  \\u2212 removed from "+m.name+" (file absent): "+me.name,"warn"); removed++;
+        return;                              // DELETED entry: drop it
+      }
+      entries.push({hash:me.hash,mode:me.mode,ext:me.ext,bytes:bytes});
     });
+    // stage-root ADDITIONS: files directly in <stage>/ that the manifest doesn't
+    // know, named <hash>.<ext> (legacy NNN_<hash>.<ext> also accepted). Inserted
+    // before the trailing marker entries so the terminator stays last.
+    var extras=[];
+    listUnder(fileMap,m.name+"/").forEach(function(p){
+      var base=p.substring(m.name.length+1);
+      if(base.indexOf("/")>=0) return;               // inside an _unpacked folder
+      if(manifestNames[base]) return;
+      var mm=base.match(/^(?:\\d{1,3}_)?(\\d+)(?:__\\d+)?\\.([a-z0-9]+)$/i);
+      if(!mm){ log("  ! extra file '"+m.name+"/"+base+"' ignored (name it HASH.EXT)","warn"); return; }
+      var extByte=0; for(var b in EXT_REV) if(EXT_REV[b]===mm[2].toLowerCase()){ extByte=+b; break; }
+      if(!extByte){ log("  ! extra file '"+base+"' ignored (unknown extension ."+mm[2]+")","warn"); return; }
+      extras.push({hash:+mm[1],ext:extByte,bytes:fileMap[p],name:base});
+    });
+    if(extras.length){
+      var lastMode=0;
+      entries.forEach(function(e){ if(!e.marker) lastMode=e.mode; });
+      var insertAt=entries.length;
+      while(insertAt>0 && entries[insertAt-1].marker) insertAt--;
+      extras.forEach(function(x,xi){
+        entries.splice(insertAt+xi,0,{hash:x.hash,mode:lastMode,ext:x.ext,bytes:x.bytes});
+        log("  + added to "+m.name+": "+x.name,"ok"); added++;
+      });
+    }
+    entries.forEach(function(e){ delete e.marker; });
     blobs[m.name]=psxRebuildStage(m.headerB64,entries);
   });
-  if(missing.length){ log("Missing files — repack aborted:","err"); missing.forEach(function(p){log("  "+p,"err");}); return; }
+  if(removed||added) log("Repack applied "+added+" addition(s) and "+removed+" deletion(s). If any deletion was unintended, restore the file and repack again.","warn");
   var out=psxRebuildDir(manifest,blobs);
   dl(out, manifest.filename||"STAGE.DIR");
   log("Repacked PSX "+(manifest.filename||"STAGE.DIR")+" — "+out.length+" bytes ("+(out.length/2048)+" sectors)","ok");
@@ -2614,13 +2701,14 @@ function repackPC(manifest,fileMap){
     if(darInfo){
       var folder=path+"_unpacked/";
       var known={};
-      var items=darInfo.names.map(function(nm){
+      var items=[];
+      darInfo.names.forEach(function(nm){
         known[nm]=1;
         var bytes=fileMap[folder+nm];
-        if(!bytes){ missing.push(folder+nm); bytes=new Uint8Array(0); }
+        if(!bytes){ log("  \\u2212 removed from "+path+" (file absent): "+nm,"warn"); return; }
         var origCrc=darInfo.crcs?darInfo.crcs[nm]:undefined;
-        return {name:nm,bytes:bytes,
-                changed:(origCrc!==undefined)&&vramCrc32(bytes)!==origCrc};
+        items.push({name:nm,bytes:bytes,
+                changed:(origCrc!==undefined)&&vramCrc32(bytes)!==origCrc});
       });
       listUnder(fileMap,folder).forEach(function(p){
         var base=p.substring(folder.length);
@@ -2636,7 +2724,11 @@ function repackPC(manifest,fileMap){
     var gcxInfo=manifest.pc.gcx[path];
     if(gcxInfo){
       var gclBytes=fileMap[gcxInfo.gclPath];
-      if(!gclBytes){ missing.push(gcxInfo.gclPath); return; }
+      if(!gclBytes){
+        log("  ! "+gcxInfo.gclPath+" absent \\u2014 keeping the ORIGINAL compiled "+path+" (scripts are load-bearing; delete not applied)","warn");
+        zip.file(path, bytesFromB64(gcxInfo.origB64));
+        return;
+      }
       if(normText(gclBytes)===gcxInfo.gclNorm){
         zip.file(path, bytesFromB64(gcxInfo.origB64));      // unchanged → byte-perfect original
       } else {
@@ -2657,10 +2749,9 @@ function repackPC(manifest,fileMap){
       return;
     }
     var bytes=fileMap[path];
-    if(!bytes){ missing.push(path); return; }
+    if(!bytes){ log("  \\u2212 removed (file absent): "+path,"warn"); return; }
     zip.file(path, bytes);
   });
-  if(missing.length){ log("Missing files — repack aborted:","err"); missing.forEach(function(p){log("  "+p,"err");}); return; }
   return zip.generateAsync({type:"uint8array",compression:"DEFLATE"}).then(function(u8){
     dl(u8, manifest.filename||"stage.mgz");
     log("Repacked PC "+(manifest.filename||"stage.mgz")+(warnings?" — "+warnings+" compiler warning(s), review above":""),"ok");
@@ -2716,45 +2807,166 @@ function handleSingleFile(file){
   rd.readAsArrayBuffer(file);
 }
 
+// Regenerate a manifest from a plain extracted FOLDER that lost its
+// _archive_manifest.json but kept the header sidecar. Structure convention
+// (produced by extractPSX): <stage>/NNN_hash.ext for plain members, and
+// <stage>/NNN_hash.dar_unpacked/MMM_hash.ext for DAR members. Ordering and
+// DAR membership come from the NNN indices in the names; headers come from
+// the sidecar. Returns {map} ready for repack(), or null if not recognizable.
+function tryRegenManifest(fileMap){
+  // find the sidecar at any depth; rebase everything under its folder
+  var sPath=null, sBest=1e9;
+  for(var p in fileMap){
+    if(p.split("/").pop()==="_archive_headers.bin"){ var d=p.split("/").length; if(d<sBest){sBest=d;sPath=p;} }
+  }
+  if(!sPath) return null;
+  var prefix=sPath.substring(0, sPath.length-"_archive_headers.bin".length);
+  var fm={};
+  for(var q in fileMap) if(q.indexOf(prefix)===0) fm[q.substring(prefix.length)]=fileMap[q];
+  var side;
+  try{ side=JSON.parse(new TextDecoder().decode(fm["_archive_headers.bin"])); }catch(e){ return null; }
+  if(!side || side.platform!=="psx" || !side.stages) return null;
+
+  var EXT_FWD={}; for(var b in EXT_REV) EXT_FWD[EXT_REV[b]]=+b;
+  function extByteOf(x){ return EXT_FWD[x.toLowerCase()]!==undefined?EXT_FWD[x.toLowerCase()]:0; }
+
+  var manifest={version:1, platform:"psx", filename:side.filename||"STAGE.DIR",
+                psx:{headB64:side.headB64, stages:[]}};
+
+  side.stages.forEach(function(sh){
+    var m={name:sh.name, nameB64:sh.nameB64, sector:sh.sector, headerB64:sh.headerB64, entries:[]};
+    // collect this stage's top-level members: <stage>/NNN_hash.ext (files) and
+    // <stage>/NNN_hash.EXT_unpacked/ (dar folders)
+    var topRe=new RegExp("^"+sh.name.replace(/[.*+?^\${}()|[\\\\]\\\\\\\\]/g,"\\\\\\\\$&")+"/([0-9]{3})_([0-9]+)\\\\.([a-z0-9]+)$","i");
+    var darFolders={};
+    for(var f in fm){
+      var dm=f.match(new RegExp("^"+sh.name.replace(/[.*+?^\${}()|[\\\\]\\\\\\\\]/g,"\\\\\\\\$&")+"/([0-9]{3})_([0-9]+)\\\\.([a-z0-9]+)_unpacked/([0-9]{3})_([0-9]+)\\\\.([a-z0-9]+)$","i"));
+      if(dm){
+        var key=dm[1]+"_"+dm[2]+"."+dm[3];
+        (darFolders[key]=darFolders[key]||{idx:+dm[1],hash:+dm[2],ext:extByteOf(dm[3]),members:[]})
+          .members.push({idx:+dm[4],hash:+dm[5],ext:extByteOf(dm[6])});
+      }
+    }
+    var members=[];
+    for(var g in fm){
+      var tm=g.match(topRe); if(!tm) continue;
+      members.push({idx:+tm[1],hash:+tm[2],ext:extByteOf(tm[3]),name:tm[1]+"_"+tm[2]+"."+tm[3]});
+    }
+    // merge dar folders (their top-level .dar member isn't a file on disk)
+    for(var k in darFolders){
+      var dfd=darFolders[k];
+      members.push({idx:dfd.idx,hash:dfd.hash,ext:dfd.ext,name:k,isDar:true,
+        dar:dfd.members.sort(function(a,b){return a.idx-b.idx;}).map(function(x){return {idx:x.idx,hash:x.hash,ext:x.ext};})});
+    }
+    members.sort(function(a,b){return a.idx-b.idx;});
+    m.entries=members;
+    manifest.psx.stages.push(m);
+  });
+
+  fm[MANIFEST]=new TextEncoder().encode(JSON.stringify(manifest));
+  return {map:fm};
+}
+
 // folder drop: walk webkitGetAsEntry tree → fileMap keyed by path relative to
 // the folder that CONTAINS the manifest.
+function processFolderFileMap(fileMap){
+    if(!Object.keys(fileMap).length){
+      log("Dropped folder was empty or unreadable — try the ZIP or the Load-folder button instead.","err"); return;
+    }
+    // manifest can be at ANY depth (folder-of-folders); pick the shallowest
+    var mPath=null, best=1e9;
+    for(var p in fileMap){
+      if(p.split("/").pop()===MANIFEST){ var d=p.split("/").length; if(d<best){best=d;mPath=p;} }
+    }
+    if(mPath){
+      var prefix=mPath.substring(0,mPath.length-MANIFEST.length);
+      var rebased={};
+      for(var q in fileMap) if(q.indexOf(prefix)===0) rebased[q.substring(prefix.length)]=fileMap[q];
+      log("Folder drop: manifest at \\u201C"+(prefix||"./")+"\\u201D, "+Object.keys(rebased).length+" files — repacking\\u2026","ok");
+      repack(rebased);
+      return;
+    }
+    // No manifest. A plain stage folder CAN still be repacked IF its layout
+    // matches what this tool's extractor produces (stage subfolders holding
+    // NNN_hash.ext members and *_unpacked/ DAR folders) — we regenerate the
+    // manifest from that structure. The one thing we cannot invent is the
+    // original binary directory/stage HEADERS, so this only works when the
+    // folder is a genuine extract from this tool (headers were saved). We
+    // detect that by looking for the sidecar header file the extractor now
+    // writes; if it's absent, explain precisely.
+    var regen=tryRegenManifest(fileMap);
+    if(regen){
+      log("Folder drop: no manifest, but structure recognized — regenerated from "+
+          Object.keys(regen.map).length+" files and headers. Repacking\\u2026","ok");
+      repack(regen.map);
+      return;
+    }
+    // Genuinely unrebuildable: report what we DID see so the user can fix it.
+    var stageDirs={}, looseCount=0;
+    for(var r in fileMap){
+      var seg=r.split("/"); if(seg.length>1) stageDirs[seg[0]]=1; else looseCount++;
+    }
+    log("No "+MANIFEST+" in the dropped folder, and it isn't a recognizable "+
+        "tool extract (missing the header sidecar), so the binary STAGE.DIR "+
+        "headers can't be reconstructed.","err");
+    log("  Found: "+Object.keys(stageDirs).length+" stage folder(s), "+looseCount+" loose file(s).","warn");
+    log("  Fix: re-extract with this tool (it now writes the manifest AND a "+
+        "header sidecar into the folder), edit files in place, then drop the "+
+        "same folder back. Keep BOTH "+MANIFEST+" and _archive_headers.bin.","warn");
+}
 function handleEntries(entries){
   reset();
-  var fileMap={}, pending=0, done=false;
-  function finish(){
+  var fileMap={}, pending=1, done=false, errors=0, nRead=0;
+  function settle(){
     if(pending>0||done) return; done=true;
-    // find manifest depth and rebase paths
-    var mPath=null;
-    for(var p in fileMap) if(p.split("/").pop()===MANIFEST){ mPath=p; break; }
-    if(!mPath){ log("No "+MANIFEST+" in the dropped folder — cannot repack.","err"); return; }
-    var prefix=mPath.substring(0,mPath.length-MANIFEST.length);
-    var rebased={};
-    for(var q in fileMap) if(q.indexOf(prefix)===0) rebased[q.substring(prefix.length)]=fileMap[q];
-    log("Folder drop: "+Object.keys(rebased).length+" files — repacking…");
-    repack(rebased);
+    if(errors) log("  ! "+errors+" file(s) could not be read from the dropped folder (locked/inaccessible) — they were skipped.","warn");
+    log("Folder drop: "+nRead+" file(s) read.","ok");
+    processFolderFileMap(fileMap);
   }
   function walk(entry,path){
-    if(entry.isFile){
-      pending++;
-      entry.file(function(f){
-        var rd=new FileReader();
-        rd.onload=function(){ fileMap[path+f.name]=new Uint8Array(rd.result); pending--; finish(); };
-        rd.readAsArrayBuffer(f);
-      });
-    } else if(entry.isDirectory){
-      pending++;
-      var reader=entry.createReader();
-      (function readAll(){
-        reader.readEntries(function(batch){
-          if(!batch.length){ pending--; finish(); return; }
-          batch.forEach(function(e){ walk(e, path+entry.name+"/"); });
-          readAll();
-        });
-      })();
-    }
+    try{
+      if(entry.isFile){
+        pending++;
+        entry.file(function(f){
+          var rd=new FileReader();
+          rd.onload=function(){ fileMap[path+f.name]=new Uint8Array(rd.result); nRead++; pending--; settle(); };
+          rd.onerror=function(){ errors++; pending--; settle(); };
+          rd.readAsArrayBuffer(f);
+        }, function(){ errors++; pending--; settle(); });   // file() error MUST release its hold
+      } else if(entry.isDirectory){
+        pending++;
+        var reader=entry.createReader(), base=path+entry.name+"/";
+        (function readAll(){
+          reader.readEntries(function(batch){
+            if(!batch.length){ pending--; settle(); return; }   // dir fully read
+            batch.forEach(function(e){ walk(e, base); });
+            readAll();                                          // 100-entry chunks
+          }, function(){ errors++; pending--; settle(); });
+        })();
+      }
+    }catch(ex){ errors++; }                                    // sync throw: never wedge the walk
   }
   entries.forEach(function(e){ walk(e,""); });
-  setTimeout(finish,0);
+  pending--; settle();   // release the initial hold now the tree is enqueued
+  setTimeout(function(){                                       // watchdog: report a wedged walk
+    if(!done) log("Still reading the folder ("+nRead+" file(s) so far)\\u2026 if this never finishes, use the Load-folder button instead of drag-and-drop.","warn");
+  }, 5000);
+}
+// Load-folder button: webkitdirectory input — immune to drag-drop file() quirks.
+function handleDirInput(files){
+  reset();
+  if(!files || !files.length){ log("No folder selected.","err"); return; }
+  var fileMap={}, left=files.length, errors=0;
+  log("Reading "+files.length+" file(s) from the selected folder\\u2026","ok");
+  Array.prototype.forEach.call(files,function(f){
+    var rd=new FileReader();
+    rd.onload=function(){
+      fileMap[(f.webkitRelativePath||f.name).replace(/\\\\/g,"/")]=new Uint8Array(rd.result);
+      if(--left===0){ if(errors) log("  ! "+errors+" unreadable file(s) skipped.","warn"); processFolderFileMap(fileMap); }
+    };
+    rd.onerror=function(){ errors++; if(--left===0){ log("  ! "+errors+" unreadable file(s) skipped.","warn"); processFolderFileMap(fileMap); } };
+    rd.readAsArrayBuffer(f);
+  });
 }
 
 // wire up UI
@@ -2778,9 +2990,10 @@ document.addEventListener("DOMContentLoaded",function(){
   try{ if(window.self!==window.top){ var hx=$("#hostExit"); hx.style.display="";
     hx.onclick=function(){ if(typeof window.ARCH_HOST_EXIT==="function") window.ARCH_HOST_EXIT(); }; } }catch(e){}
   $("#fileIn").onchange=function(e){ if(e.target.files[0]) handleSingleFile(e.target.files[0]); };
+  $("#pickDir").onclick=function(){ $("#dirIn").click(); };
+  $("#dirIn").onchange=function(e){ handleDirInput(e.target.files); e.target.value=""; };
 });
 })();
-
 <\/script>
 
 <script>
@@ -2808,6 +3021,20 @@ document.addEventListener("DOMContentLoaded",function(){
 "use strict";
 
 var SWAP_REGION_INIT = { x1: 640, y1: 0, x2: 1024, y2: 240 };
+
+// Retail resident CLUT positions, extracted from pristine STAGE.DIRs. Inside
+// the engine palette block, ONLY these exact slots are Konami-proven against
+// every stage's palette-effect/backup traffic. A "freed" slot inherited from
+// a previously-modded resident (tool-chosen position) proves nothing — that
+// was the Otacon-chest bug: an inherited in-block slot at a non-retail spot.
+// NOTE: retail also records cluts at x960-1008 (the codec/staging column),
+// but the ENGINE maintains those palettes itself (face streaming, menu
+// refresh) — reusing a freed slot there gets overwritten immediately (the
+// "17 files mangled at (960,226)" regression). Trust stops at x944.
+var SWAP_RETAIL_CLUTS = {
+  integral: ["768,226","768,227","768,228","768,229","784,226","784,227","784,229","800,226","800,227","800,228","816,226","816,227","816,228","832,226","832,227","832,228","848,226","848,227","848,228","864,226","864,227","864,228","880,226","880,227","880,228","896,226","896,227","896,228","912,226","912,227","912,228","928,226","928,227","928,228","944,226","944,227","944,228"],
+  jp: ["0,240","0,241","112,240","112,241","128,240","128,241","144,240","16,240","16,241","160,240","176,240","192,240","208,240","224,240","240,240","256,240","272,240","288,240","304,240","32,240","32,241","320,240","336,240","352,240","368,240","384,240","400,240","416,240","432,240","448,240","464,240","480,240","48,240","48,241","496,240","512,240","528,240","544,240","560,240","576,240","592,240","608,240","624,240","64,240","64,241","80,240","80,241","96,240","96,241","960,209"]
+};
 
 // GV_StrCode — same hash the game uses for file names.
 function SWAP_mgsHash(s){
@@ -2874,20 +3101,236 @@ function SWAP_findResidentClutSlot(allCluts, allTex, nc){
   return null;
 }
 
-// Palette identity by CONTENT: PCX carries its palette in-file (4bpp: header
-// bytes 16-63; 8bpp: trailing 768 bytes after the 0x0C marker). Textures with
-// byte-identical palettes share one destination CLUT even if they used
-// different source slots — lossless demand reduction for big characters.
-function SWAP_paletteKey(bytes, bpp, fallback){
-  function fnv(buf, from, to){
-    var h = 0x811c9dc5;
-    for (var i = from; i < to; i++){ h ^= buf[i]; h = (h * 0x01000193) >>> 0; }
-    return h.toString(16);
+// Decode a 4bpp EGA PCX's pixel data and report which palette indices the
+// image actually references. RLE is decoded as one continuous stream (runs
+// that respect scanline bounds decode identically). Returns Uint8Array(16)
+// of 0/1 flags, or null if the file isn't a decodable 4bpp EGA PCX.
+function SWAP_pcxUsedIndices(bytes){
+  if (!bytes || bytes.length < 130 || bytes[0] !== 10) return null;
+  if (bytes[3] !== 1 || bytes[65] !== 4) return null;
+  var w = (bytes[8] | (bytes[9] << 8)) - (bytes[4] | (bytes[5] << 8)) + 1;
+  var h = (bytes[10] | (bytes[11] << 8)) - (bytes[6] | (bytes[7] << 8)) + 1;
+  var bpl = bytes[66] | (bytes[67] << 8);
+  if (w <= 0 || h <= 0 || bpl <= 0 || w > 1024 || h > 1024) return null;
+  var total = bpl * 4 * h, buf = new Uint8Array(total);
+  var o = 0, p = 128, b, n, v;
+  while (o < total && p < bytes.length){
+    b = bytes[p++];
+    if ((b & 0xC0) === 0xC0){ n = b & 0x3F; v = bytes[p++]; while (n-- && o < total) buf[o++] = v; }
+    else buf[o++] = b;
   }
-  if (bpp === 4 && bytes.length >= 64) return "p4:" + fnv(bytes, 16, 64);
-  if (bpp === 8 && bytes.length > 769 && bytes[bytes.length - 769] === 0x0C)
-    return "p8:" + fnv(bytes, bytes.length - 768, bytes.length);
-  return "src:" + fallback;
+  var used = new Uint8Array(16);
+  for (var y = 0; y < h; y++){
+    var r = y * bpl * 4;
+    for (var x = 0; x < w; x++){
+      var bi = x >> 3, bit = 7 - (x & 7);
+      var idx = ((buf[r + bi] >> bit) & 1) |
+                (((buf[r + bpl + bi] >> bit) & 1) << 1) |
+                (((buf[r + 2 * bpl + bi] >> bit) & 1) << 2) |
+                (((buf[r + 3 * bpl + bi] >> bit) & 1) << 3);
+      used[idx] = 1;
+    }
+  }
+  return used;
+}
+
+// Decode a 4bpp EGA PCX into a per-pixel index buffer (w*h), or null.
+function SWAP_pcxDecodeIndices(bytes){
+  if (!bytes || bytes.length < 130 || bytes[0] !== 10) return null;
+  if (bytes[3] !== 1 || bytes[65] !== 4) return null;
+  var w = (bytes[8] | (bytes[9] << 8)) - (bytes[4] | (bytes[5] << 8)) + 1;
+  var h = (bytes[10] | (bytes[11] << 8)) - (bytes[6] | (bytes[7] << 8)) + 1;
+  var bpl = bytes[66] | (bytes[67] << 8);
+  if (w <= 0 || h <= 0 || bpl <= 0 || w > 1024 || h > 1024) return null;
+  var total = bpl * 4 * h, buf = new Uint8Array(total);
+  var o = 0, p = 128, b, n, v;
+  while (o < total && p < bytes.length){
+    b = bytes[p++];
+    if ((b & 0xC0) === 0xC0){ n = b & 0x3F; v = bytes[p++]; while (n-- && o < total) buf[o++] = v; }
+    else buf[o++] = b;
+  }
+  var px = new Uint8Array(w * h);
+  for (var y = 0; y < h; y++){
+    var r = y * bpl * 4;
+    for (var x = 0; x < w; x++){
+      var bi = x >> 3, bit = 7 - (x & 7);
+      px[y * w + x] = ((buf[r + bi] >> bit) & 1) |
+                      (((buf[r + bpl + bi] >> bit) & 1) << 1) |
+                      (((buf[r + 2 * bpl + bi] >> bit) & 1) << 2) |
+                      (((buf[r + 3 * bpl + bi] >> bit) & 1) << 3);
+    }
+  }
+  return { px: px, w: w, h: h, bpl: bpl };
+}
+
+// Rebuild a 4bpp EGA PCX from an index buffer, reusing the original 128-byte
+// header (palette rewritten by the caller). RLE runs never cross a plane line.
+function SWAP_pcxEncodeIndices(header, dec){
+  var w = dec.w, h = dec.h, bpl = dec.bpl, px = dec.px;
+  var out = [];
+  for (var y = 0; y < h; y++){
+    for (var pl = 0; pl < 4; pl++){
+      var line = new Uint8Array(bpl);
+      for (var x = 0; x < w; x++)
+        if ((px[y * w + x] >> pl) & 1) line[x >> 3] |= 1 << (7 - (x & 7));
+      var i = 0;
+      while (i < bpl){
+        var v = line[i], n = 1;
+        while (i + n < bpl && line[i + n] === v && n < 63) n++;
+        if (n > 1 || (v & 0xC0) === 0xC0) out.push(0xC0 | n, v);
+        else out.push(v);
+        i += n;
+      }
+    }
+  }
+  var bytes = new Uint8Array(128 + out.length);
+  bytes.set(header.subarray(0, 128));
+  bytes.set(out, 128);
+  return bytes;
+}
+
+// Union-fit palette grouping with lossless pixel remap. Rips are often
+// palettized per image: same material colors, different index layouts, junk
+// in unused entries — so index-wise comparison can't merge them, but their
+// COLOR sets overlap heavily. Bin-pack the 1555 color sets (16 per clut),
+// then remap every member's pixels onto its bin's shared palette and
+// re-encode. On-screen colors are preserved exactly: PSX index order is
+// meaningless and transparency keys on color VALUE 0, not index.
+// Mutates each add: bytes may be replaced, gid assigned.
+function SWAP_groupAdds(adds, groupMode){
+  var bins = [], keyGroups = {}, nextGid = 0;
+  // Color identity for merging. Two rules learned in game:
+  // 1. The loader's transparency test is on EXACT RGB black: (0,0,0)
+  //    uploads transparent, while near-black like (5,3,2) uploads opaque —
+  //    so exact black gets its own key and always keeps its exact bytes.
+  // 2. The loader's 8-bit -> 1555 conversion ROUNDS (proven by in-game
+  //    shade shifts when truncation-equal colors were merged). So colors
+  //    only merge when they quantize identically under BOTH truncation and
+  //    rounding — then the GPU result is identical under either converter
+  //    and representative substitution is provably invisible. Ambiguous
+  //    pairs (e.g. 48 vs 52: truncate together, round apart) stay separate
+  //    entries, each keeping its own exact bytes.
+  // groupMode 0 (default): dual-quantization keys — merges are provably
+  // invisible under either converter. groupMode 1 (fallback when the safe
+  // CLUT budget would otherwise overflow): truncation-only keys — merged
+  // colors may shift by at most one 5-bit shade step under rounding.
+  function ckey(r, g, b){
+    if (r === 0 && g === 0 && b === 0) return "T";
+    var t15 = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    if (groupMode === 1) return "c" + t15;
+    function q(v){ return Math.min(31, (v + 4) >> 3); }          /* shift-round */
+    function s(v){ return ((v * 31 + 127) / 255) | 0; }          /* scale-round */
+    var r15 = (q(r) << 10) | (q(g) << 5) | q(b);
+    var s15 = (s(r) << 10) | (s(g) << 5) | s(b);
+    return "c" + t15 + "_" + r15 + "_" + s15;
+  }
+  adds.forEach(function(a){
+    var dec = a.slot.bpp === 4 ? SWAP_pcxDecodeIndices(a.bytes) : null;
+    if (!dec){
+      var kk = SWAP_paletteKey(a.bytes, a.slot);   /* non-decodable: exact-key dedupe */
+      if (keyGroups[kk] === undefined) keyGroups[kk] = "k" + (nextGid++);
+      a.gid = keyGroups[kk];
+      return;
+    }
+    // Index 0 is additionally position-reserved (idx0 pixels stay idx0,
+    // non-zero stay non-zero) so BOTH known PSX transparency conventions
+    // are preserved exactly.
+    var usesIdx0 = false, nz = {}, i, idx;
+    for (i = 0; i < dec.px.length; i++){
+      idx = dec.px[i];
+      var po = 16 + idx * 3;
+      if (idx === 0){ usesIdx0 = true; continue; }
+      var k = ckey(a.bytes[po], a.bytes[po + 1], a.bytes[po + 2]);
+      if (!(k in nz)) nz[k] = [a.bytes[po], a.bytes[po + 1], a.bytes[po + 2]];
+    }
+    var c0key = null, c0rgb = null;
+    if (usesIdx0){
+      c0key = ckey(a.bytes[16], a.bytes[17], a.bytes[18]);
+      c0rgb = [a.bytes[16], a.bytes[17], a.bytes[18]];
+    }
+    var keys = Object.keys(nz);
+    var bi = -1;
+    for (i = 0; i < bins.length && bi < 0; i++){
+      var B0 = bins[i];
+      if (c0key && B0.c0key && B0.c0key !== c0key) continue;
+      var extra = 0;
+      for (var k2 = 0; k2 < keys.length; k2++) if (!(keys[k2] in B0.nz)) extra++;
+      if (Object.keys(B0.nz).length + extra <= 15) bi = i;
+    }
+    if (bi < 0){ bins.push({ c0key: null, c0rgb: null, nz: {}, members: [], gid: "b" + (nextGid++) }); bi = bins.length - 1; }
+    var B = bins[bi];
+    if (c0key && !B.c0key){ B.c0key = c0key; B.c0rgb = c0rgb; }
+    keys.forEach(function(k3){ if (!(k3 in B.nz)) B.nz[k3] = nz[k3]; });
+    B.members.push({ add: a, dec: dec });
+    a.gid = B.gid;
+  });
+  // Build each bin's palette (entry 0 = the transparency/idx0 color, 1..15 =
+  // opaque colors, remainder zero-filled) and rewrite every member: full
+  // 16-entry palette written identically so all uploads to the shared slot
+  // are byte-identical, plus remapped, re-encoded pixels.
+  bins.forEach(function(B){
+    if (!B.nz) return;
+    var order = Object.keys(B.nz);                 /* insertion order, ≤15 */
+    var newIdxOf = {}; order.forEach(function(k, i){ newIdxOf[k] = i + 1; });
+    B.members.forEach(function(m){
+      var a = m.add, dec = m.dec, i, idx;
+      var map = new Uint8Array(16);
+      map[0] = 0;                                  /* idx0 stays put */
+      for (idx = 1; idx < 16; idx++){
+        var po = 16 + idx * 3;
+        var k = ckey(a.bytes[po], a.bytes[po + 1], a.bytes[po + 2]);
+        map[idx] = (k in newIdxOf) ? newIdxOf[k] : 0;   /* unused → harmless */
+      }
+      var remapped = new Uint8Array(dec.px.length);
+      for (i = 0; i < dec.px.length; i++) remapped[i] = map[dec.px[i]];
+      var header = new Uint8Array(a.bytes.subarray(0, 128));
+      var e0 = B.c0rgb || [0, 0, 0];
+      header[16] = e0[0]; header[17] = e0[1]; header[18] = e0[2];
+      for (idx = 1; idx < 16; idx++){
+        var rgb = idx - 1 < order.length ? B.nz[order[idx - 1]] : [0, 0, 0];
+        header[16 + idx * 3] = rgb[0]; header[17 + idx * 3] = rgb[1]; header[18 + idx * 3] = rgb[2];
+      }
+      // CLUT-width fix: unifying textures onto a shared palette relocates a
+      // member's colors to indices as high as \`order.length\` (opaque colors
+      // occupy slots 1..order.length above the idx0/transparency slot). The
+      // PC init loader (DG_LoadInitPcx) uploads exactly PCXINFO.n_colors CLUT
+      // entries, so a member whose ORIGINAL n_colors was smaller would have its
+      // relocated (often bright) high-index colors left off the VRAM CLUT and
+      // render transparent/garbage. Widen n_colors to cover every populated
+      // index so the whole shared palette uploads. Never shrink below the
+      // original, and never exceed 16 (EGA CLUT size). PSX 4bpp uploads a fixed
+      // 16-entry CLUT regardless of this field, so PSX behaviour is unchanged.
+      var origNc = header[86] | (header[87] << 8);
+      var needNc = Math.min(16, order.length + 1);   /* idx0 + opaque colors */
+      var newNc = Math.max(origNc, needNc);
+      header[86] = newNc & 0xff; header[87] = (newNc >> 8) & 0xff;
+      a.bytes = SWAP_pcxEncodeIndices(header, { px: remapped, w: dec.w, h: dec.h, bpl: dec.bpl });
+      a.slot = vramSlotOf(a.name, a.bytes);
+    });
+  });
+}
+
+// Palette identity for CLUT grouping. 4bpp EGA PCX carries its 16-color
+// palette in header bytes 16-63; 8bpp VGA PCX appends a 768-byte palette
+// after a 0x0C marker. The key quantizes each RGB triple to PSX 1555 —
+// that is the exact data the GPU clut upload sees, so palettes differing
+// only in sub-5-bit rip/expansion noise group together (retail files that
+// share a clut slot are bit-identical; stage rips often are not).
+function SWAP_paletteKey(bytes, slot){
+  var k, i;
+  function q(o){ return (((bytes[o] >> 3) << 10) | ((bytes[o + 1] >> 3) << 5) |
+                          (bytes[o + 2] >> 3)).toString(16).padStart(4, "0"); }
+  if (slot.bpp === 4){
+    k = "p4:";
+    for (i = 16; i < 64; i += 3) k += q(i);
+    return k;
+  }
+  if (bytes.length > 769 && bytes[bytes.length - 769] === 12){
+    k = "p8:"; var off = bytes.length - 768;
+    for (i = 0; i < 768; i += 3) k += q(off + i);
+    return k;
+  }
+  return "u:" + Math.random();     /* unknown layout: never group */
 }
 
 // ── shared placement core ────────────────────────────────────────────────────
@@ -2895,150 +3338,449 @@ function SWAP_paletteKey(bytes, bpp, fallback){
 // Returns {ok, errors, warnings, mapping, adds:[{name,hash,bytes,slot}]} with
 // bytes as private, placement-written copies. Freed rects/CLUTs (positions the
 // removed textures held — proven resident-safe) are preferred.
-function SWAP_place(kept, removed, addFiles){
-  var res = { ok: false, errors: [], warnings: [], mapping: [], adds: [] };
-
-  // freed placement hints (proven resident-safe positions)
-  var freedRects = removed.map(function(t){ return { x: t.slot.px, y: t.slot.py,
-    w: t.slot.vw, h: t.slot.h, bpp: t.slot.bpp }; });
-  var freedCluts = removed.map(function(t){ return { cx: t.slot.cx, cy: t.slot.cy,
-    nc: t.slot.nc }; });
-
-  // live occupancy = every kept texture in the whole stage
-  var occupied = kept.map(function(t){ return t.slot; });
-  var cluts    = kept.map(function(t){ return t.slot; });
-
-  // validate + copy the incoming files (never mutate caller bytes)
-  var adds = [];
+function SWAP_place(kept, removed, addFiles, opts){
+  opts = opts || {};
+  // Preparation (once): validate files, group palettes by union-fit color
+  // packing, remap member pixels onto shared palettes. attemptPlace then
+  // works from these prepared bytes, copying fresh per attempt.
+  var prepErrors = [], pristine = [];
   addFiles.forEach(function(f){
-    var bytes = new Uint8Array(f.bytes);            // private copy
+    var bytes = new Uint8Array(f.bytes);
     var slot = vramSlotOf(f.name, bytes);
-    if (!slot){ res.errors.push(f.name + ": not a valid PSX texture PCX (no PCXINFO)"); return; }
-    adds.push({ name: f.name, hash: f.hash, bytes: bytes, slot: slot });
+    if (!slot){ prepErrors.push(f.name + ": not a valid PSX texture PCX (no PCXINFO)"); return; }
+    pristine.push({ name: f.name, hash: f.hash, bytes: bytes, slot: slot });
   });
-  if (res.errors.length) return res;
-  res.adds = adds;
+  if (prepErrors.length)
+    return { ok: false, errors: prepErrors, warnings: [], mapping: [], adds: [] };
+  function makePrepared(groupMode){
+    var list = pristine.map(function(f){
+      var b = new Uint8Array(f.bytes);
+      return { name: f.name, hash: f.hash, bytes: b, slot: vramSlotOf(f.name, b) };
+    });
+    SWAP_groupAdds(list, groupMode);
+    return list;
+  }
+  var prepared = makePrepared(0);
+  // One placement pass over a given packing order. Runs on fresh state every
+  // time so the retry driver below can reorder and re-run safely.
+  function attemptPlace(promoted, sortMode){
+    var res = { ok: false, errors: [], warnings: [], mapping: [], adds: [] };
 
-  // first-fit-decreasing by pixel area
-  adds.sort(function(a, b){
-    return (b.slot.vw * b.slot.h) - (a.slot.vw * a.slot.h) || a.hash - b.hash;
-  });
+    // Freed placement hints — QUALIFIED. A freed rect is only proven when
+    // the removed occupant could have proven it: fully inside the resident
+    // texture region (y<240) and clear of the Integral glyph/backup band.
+    // A previously-modded resident can carry textures at stage-territory
+    // positions (e.g. y256 — rewritten on every area load) or inside the
+    // band; inheriting those rects poisons the new character (the mangled
+    // chest piece placed at an inherited (768,256) rect).
+    var freedRects = [];
+    removed.forEach(function(t){
+      var fr = { x: t.slot.px, y: t.slot.py, w: t.slot.vw, h: t.slot.h, bpp: t.slot.bpp };
+      if (fr.y + fr.h > 240){
+        res.warnings.push("freed rect (" + fr.x + "," + fr.y + " " + fr.w + "x" + fr.h +
+          ") reaches stage-pack territory (y\\u2265240) \\u2014 inherited from a previous mod, not reused");
+        return;
+      }
+      freedRects.push(fr);
+    });
 
-  // Only the FREED footprint (the old character's rects) is provably free of
-  // engine-owned VRAM: fonts, menu images, and the codec face staging column
-  // (x960+, radiotex.c) live in the init region WITHOUT appearing in any
-  // stage file's records — fresh placements there get streamed over at
-  // runtime (the "face/skin broken" bug). So: pack INSIDE freed rects at any
-  // offset first; only then fall back outside, avoiding x960+, with a loud
-  // per-file warning.
-  function fitInFreed(s){
-    for (var i = 0; i < freedRects.length; i++){
-      var fr = freedRects[i];
-      if (fr.w < s.vw || fr.h < s.h) continue;
-      for (var y = fr.y; y + s.h <= fr.y + fr.h; y++){
-        for (var x = fr.x; x + s.vw <= fr.x + fr.w; x++){
-          if (crossesTPage(x, s.vw, s.bpp)) continue;
-          var cand = { x: x, y: y, w: s.vw, h: s.h }, ok = true, j;
-          for (j = 0; j < occupied.length; j++) if (rectsOverlap(cand, texRect(occupied[j]))){ ok = false; break; }
-          if (ok) for (j = 0; j < cluts.length; j++)
-            if (rectsOverlap(cand, { x: cluts[j].cx, y: cluts[j].cy, w: cluts[j].nc, h: 1 })){ ok = false; break; }
-          if (ok) return { px: x, py: y };
+    // Freed CLUT slots, deduped, and — critically — dropped if any KEPT
+    // texture still records an overlapping span: cluts are SHARED (the
+    // removed set here funnels through a handful of slots), so a slot is
+    // only truly freed when no survivor points at it. Reusing a shared slot
+    // uploads the new palette over the survivor's colors.
+    // Layout detection first (needed to pick the retail whitelist):
+    // Integral keeps resident cluts below y240, JP at y240+.
+    var integralLayout = (function(){
+      var below = 0, at240 = 0;
+      kept.concat(removed).forEach(function(t){
+        var cy = t.slot.cy;
+        if (cy >= 200 && cy < 240) below++; else if (cy >= 240) at240++;
+      });
+      return below > at240;
+    })();
+    var retailSet = {};
+    SWAP_RETAIL_CLUTS[integralLayout ? "integral" : "jp"].forEach(function(k){ retailSet[k] = 1; });
+    function inPaletteBlock(cx, cy){ return cx >= 768 && cy >= 226 && cy <= 255; }
+
+    var freedCluts = [], seenFc = {};
+    removed.forEach(function(t){
+      var k = t.slot.cx + "," + t.slot.cy;
+      if (seenFc[k]) return; seenFc[k] = 1;
+      var fc = { cx: t.slot.cx, cy: t.slot.cy, nc: t.slot.nc };
+      var shared = kept.some(function(kt){ return clutsOverlap(fc, kt.slot); });
+      if (shared) return;
+      // In-block freed slots must be RETAIL positions to count as proven.
+      // (Out-of-block freed slots are fresh-texture-class VRAM — fine.)
+      if (inPaletteBlock(fc.cx, fc.cy) && !retailSet[k]){
+        res.warnings.push("freed CLUT slot (" + k + ") is inside the engine palette block at a " +
+          "NON-RETAIL position (inherited from a previous mod?) — not trusted, not reused");
+        return;
+      }
+      // The codec/staging column x960+ is engine-refreshed: even retail cluts
+      // there are maintained by code, and a reused slot gets overwritten.
+      if (fc.cx >= 960){
+        res.warnings.push("freed CLUT slot (" + k + ") is in the engine-refreshed x960+ column " +
+          "\\u2014 not trusted, not reused");
+        return;
+      }
+      freedCluts.push(fc);
+    });
+
+    // Rows already hosting KEPT resident cluts are engine-proven: the retail
+    // packer only records cluts where the engine won't stomp them, and the
+    // two builds disagree (JP: y240-241 at x0-32; EN/JP: y226-229 — with
+    // y230-239 conspicuously untouched because the multilanguage engine
+    // stages font/menu palettes there). Fresh cluts therefore co-tenant
+    // into recorded rows instead of trusting any record-free row.
+    // CLUT SAFETY MODEL (learned the hard way, two in-game failures):
+    // the engine palette system owns the ENTIRE live block x768-1024
+    // y226-255 (libdg palette1) and its backup at {768,196} shares VRAM
+    // with the Integral glyph band. Effects (caution flash, goggles,
+    // sepia) strip-copy backup rows over live rows — so any in-block slot
+    // retail did not itself claim can be stomped stage-dependently (fresh
+    // cluts corrupted at row 229 AND at (784,228) in s01a while freed
+    // slots survived everywhere). Exact-slot safety only:
+    //   tier 1: freed clut slots (the removed character held them through
+    //           every stage — proven).
+    //   tier 2: 16-aligned 16x1 strips INSIDE freed TEXTURE rects — VRAM
+    //           the old character's pixels occupied through every stage.
+    //           Outside the palette block, so palette effects (whiteout,
+    //           goggle tint) skip these palettes: cosmetic-only tradeoff.
+    // There is NO fresh in-block tier anymore.
+
+    // live occupancy = every kept texture in the whole stage
+    var occupied = kept.map(function(t){ return t.slot; });
+    var cluts    = kept.map(function(t){ return t.slot; });
+
+    // validate + copy the incoming files (never mutate caller bytes; fresh
+    // copies per attempt so a failed attempt's placement writes are discarded)
+    var adds = [];
+    prepared.forEach(function(f){
+      var bytes = new Uint8Array(f.bytes);             /* fresh per attempt */
+      var slot = vramSlotOf(f.name, bytes);
+      adds.push({ name: f.name, hash: f.hash, bytes: bytes, slot: slot,
+                  pri: promoted[f.name] ? 0 : 1, gid: f.gid });
+    });
+    res.adds = adds;
+
+    // one CLUT slot per palette group (grouping done once, prep-time)
+    var groupClut = {};
+
+    // ── CLUT PRE-RESERVATION ────────────────────────────────────────────────
+    // Retail packs the init region SOLID below the band gutter (zero free
+    // 16x1 aligned holes at y0-187 in a pristine file), so fresh strips used
+    // to gravitate to the gutter row 195 — which the glyph/backup band's
+    // stage-dependent text traffic can graze (Liquid-pants / green-guard-neck:
+    // corrupt in s01a, clean in s08b). The only proven ground with room is the
+    // FREED-RECT UNION — but textures consume it during placement. So group
+    // cluts are reserved FIRST, before any texture placement:
+    //   tier 1: freed clut slots (retail positions)
+    //   tier 1.5: 16-aligned 16x1 spans in the freed union — ADJACENT freed
+    //             rects merge, so spans wider than any single removed piece
+    //             exist (removed characters pack contiguously in retail)
+    //   (unresolved groups fall to the per-add guarded backstop below)
+    (function reserveGroupCluts(){
+      var gids = {}, order = [];
+      adds.forEach(function(a){
+        var nc = a.slot.nc || 16;
+        if (!(a.gid in gids)){ gids[a.gid] = nc; order.push(a.gid); }
+        else if (nc > gids[a.gid]) gids[a.gid] = nc;
+      });
+      function fits(cc){
+        var k;
+        for (k = 0; k < cluts.length; k++) if (clutsOverlap(cc, cluts[k])) return false;
+        for (k = 0; k < occupied.length; k++)
+          if (rectsOverlap({ x: cc.cx, y: cc.cy, w: cc.nc, h: 1 }, texRect(occupied[k]))) return false;
+        return true;
+      }
+      // is [x, x+nc) at row y fully covered by the freed-rect union?
+      function unionCovers(y, x, nc){
+        var iv = [], i;
+        for (i = 0; i < freedRects.length; i++){
+          var fr = freedRects[i];
+          if (y >= fr.y && y < fr.y + fr.h) iv.push([fr.x, fr.x + fr.w]);
+        }
+        if (!iv.length) return false;
+        iv.sort(function(a, b){ return a[0] - b[0]; });
+        var pos = x, end = x + nc;
+        for (i = 0; i < iv.length && pos < end; i++){
+          if (iv[i][1] <= pos) continue;
+          if (iv[i][0] > pos) return false;
+          pos = Math.min(end, iv[i][1]);
+        }
+        return pos >= end;
+      }
+      order.forEach(function(gid){
+        var nc = gids[gid], cl = null, via = false, union = false, i;
+        for (i = 0; i < freedCluts.length && !cl; i++){
+          var fc = freedCluts[i];
+          if (fc.nc < nc) continue;
+          for (var off = 0; off + nc <= fc.nc && !cl; off += 16){
+            var cc = { cx: fc.cx + off, cy: fc.cy, nc: nc };
+            if (fits(cc)){ cl = { cx: cc.cx, cy: cc.cy }; via = true; }
+          }
+        }
+        if (!cl){
+          for (var y = 239; y >= 0 && !cl; y--){
+            for (var x = 640; x + nc <= 960 && !cl; x += 16){
+              if (!unionCovers(y, x, nc)) continue;
+              var cc2 = { cx: x, cy: y, nc: nc };
+              if (!fits(cc2)) continue;
+              cl = { cx: x, cy: y }; union = true;
+            }
+          }
+        }
+        // tier 1.75: the UNDRAWN DEAD ZONE — x320-512, rows 240-245.
+        // The draw environment is HARDCODED 320 wide (libdg/display.c:
+        // SetDefDrawEnv(&drawenv, 0, 0, 320, disp.h)), so x320+ is never
+        // rendered by either frame buffer — and disp.h can be 256 at
+        // runtime, which is exactly why x0-320 rows 240-255 got painted
+        // with scene pixels in some stages (the green-pants regression:
+        // cluts at (0,240) were inside the drawn area whenever the
+        // 256-line mode was active). x320-512 is dead BY GEOMETRY.
+        // Double proof: the JP disc's STAGE packs keep cluts at x320-512
+        // y240-241 in every stage and render correctly all game — the GPU
+        // never touches the zone. On Integral layout no stage records
+        // anything there, so a resident clut survives every load.
+        // INTEGRAL-ONLY: on JP layout the stage band owns these rows.
+        if (!cl && integralLayout){
+          var deadRows = [240, 241, 242, 243, 244, 245];
+          for (var dr = 0; dr < deadRows.length && !cl; dr++){
+            for (var dx = 320; dx + nc <= 512 && !cl; dx += 16){
+              var cc3 = { cx: dx, cy: deadRows[dr], nc: nc };
+              if (fits(cc3)) cl = { cx: dx, cy: deadRows[dr] };
+            }
+          }
+          if (cl) res.warnings.push("palette group: CLUT placed in the undrawn dead zone at (" + cl.cx +
+            "," + cl.cy + ") — x320+ is outside the hardcoded 320-wide draw environment, so no frame " +
+            "ever renders there; stage packs record nothing there on this layout. Full-screen palette " +
+            "effects will not tint this palette (cosmetic-only).");
+        }
+        if (cl){
+          groupClut[gid] = { cx: cl.cx, cy: cl.cy, viaFreed: via };
+          cluts.push({ cx: cl.cx, cy: cl.cy, nc: nc });   /* reserve vs textures */
+          if (union)
+            res.warnings.push("palette group: CLUT reserved inside the freed footprint at (" +
+              cl.cx + "," + cl.cy + ") — proven ground (the removed character's pixels lived " +
+              "there through every stage)");
+        }
+      });
+    })();
+
+    // first-fit-decreasing; textures that failed a previous attempt are
+    // promoted to the front (pri 0). The secondary key rotates per retry
+    // (area / height / max-dimension) — different orders reach packings
+    // greedy area-order misses.
+    adds.sort(function(a, b){
+      var ka, kb;
+      if (sortMode === 1){ ka = a.slot.h; kb = b.slot.h; }
+      else if (sortMode === 2){ ka = Math.max(a.slot.vw, a.slot.h); kb = Math.max(b.slot.vw, b.slot.h); }
+      else { ka = a.slot.vw * a.slot.h; kb = b.slot.vw * b.slot.h; }
+      return a.pri - b.pri || (kb - ka) ||
+        (b.slot.vw * b.slot.h) - (a.slot.vw * a.slot.h) || a.hash - b.hash;
+    });
+
+    // Only the FREED footprint (the old character's rects) is provably free of
+    // engine-owned VRAM: fonts, menu images, and the codec face staging column
+    // (x960+, radiotex.c) live in the init region WITHOUT appearing in any
+    // stage file's records — fresh placements there get streamed over at
+    // runtime (the "face/skin broken" bug). So: pack INSIDE freed rects at any
+    // offset first; only then fall back outside, avoiding x960+, with a loud
+    // per-file warning.
+    function fitInFreed(s){
+      for (var i = 0; i < freedRects.length; i++){
+        var fr = freedRects[i];
+        if (fr.w < s.vw || fr.h < s.h) continue;
+        for (var y = fr.y; y + s.h <= fr.y + fr.h; y++){
+          for (var x = fr.x; x + s.vw <= fr.x + fr.w; x++){
+            if (crossesTPage(x, s.vw, s.bpp)) continue;
+            var cand = { x: x, y: y, w: s.vw, h: s.h }, ok = true, j;
+            /* inherited rects can graze the glyph/backup band on modded
+               residents — never place SAMPLED texels inside it */
+            for (j = 0; j < freshBlocked.length; j++)
+              if (rectsOverlap(cand, texRect(freshBlocked[j]))){ ok = false; break; }
+            if (!ok) continue;
+            for (j = 0; j < occupied.length; j++) if (rectsOverlap(cand, texRect(occupied[j]))){ ok = false; break; }
+            if (ok) for (j = 0; j < cluts.length; j++)
+              if (rectsOverlap(cand, { x: cluts[j].cx, y: cluts[j].cy, w: cluts[j].nc, h: 1 })){ ok = false; break; }
+            if (ok) return { px: x, py: y };
+          }
         }
       }
+      return null;
     }
-    return null;
-  }
-  // ── PHASE 1: place every texture rect inside the freed footprint ──
-  var placements = [];
-  var failed = false;
-  adds.forEach(function(a){
-    var s = a.slot;
-    var place = fitInFreed(s);
-    if (!place){
-      res.errors.push(a.name + ": no space in the freed footprint for " + s.vw + "x" + s.h +
-        " (" + s.bpp + "bpp). The freed rects are the only engine-safe resident VRAM " +
-        "(menu images / codec staging occupy the rest without appearing in stage records) " +
-        "— check MORE resident textures for removal in Step 1.");
-      failed = true; return;
-    }
-    placements.push({ a: a, place: place });
-    occupied.push({ px: place.px, py: place.py, vw: s.vw, h: s.h,
-                    cx: -64, cy: -64, nc: 0, bpp: s.bpp });
-  });
-  if (failed) return res;
+    // opts.wideInit (PC only) opens the x960-1024 strip. Measured from retail:
+    // no gameplay stage places TEXTURES anywhere in the resident band (y<256,
+    // x>=640), retail itself seats resident textures out to x965, and a shipped
+    // build with adds at x972/x983 renders correctly. The y cap drops to 226
+    // because stage CLUTs occupy y233-253 spanning x768-1024 and are rewritten
+    // on every stage load. PSX never passes wideInit, so its region is unchanged.
+    var REGION_SAFE = opts.wideInit
+      ? { x1: SWAP_REGION_INIT.x1, y1: SWAP_REGION_INIT.y1, x2: 1024, y2: 226 }
+      : { x1: SWAP_REGION_INIT.x1, y1: SWAP_REGION_INIT.y1,
+          x2: 960, y2: SWAP_REGION_INIT.y2 };   /* x960+ engine-owned */
 
-  // ── PHASE 2: palette groups (shared source CLUT = shared palette = one
-  //    destination slot). Capacity = freed CLUT slots + LEFTOVER space inside
-  //    the freed rects after phase 1 — CLUTs are 16-aligned 1-row strips, and
-  //    the vacated rects are proven engine-safe, so their unused rows host
-  //    palettes without touching any kept resident texture. ──
-  var uniqFreedCluts = [];
-  (function(){
-    var seen = {};
-    freedCluts.forEach(function(fc){
-      var k = fc.cx + "," + fc.cy;
-      if (!seen[k]){ seen[k] = 1; uniqFreedCluts.push({ cx: fc.cx, cy: fc.cy, nc: fc.nc }); }
-    });
-  })();
-  function clutFits(cx, cy, nc){
-    var cand = { cx: cx, cy: cy, nc: nc }, j;
-    for (j = 0; j < cluts.length; j++) if (clutsOverlap(cand, cluts[j])) return false;
-    for (j = 0; j < occupied.length; j++)
-      if (rectsOverlap({ x: cx, y: cy, w: nc, h: 1 }, texRect(occupied[j]))) return false;
-    return true;
-  }
-  var groups = {};
-  adds.forEach(function(a){
-    a._gkey = SWAP_paletteKey(a.bytes, a.slot.bpp, a.slot.cx + "," + a.slot.cy);
-    var k = a._gkey;
-    if (!groups[k]) groups[k] = { nc: 0, dest: null, via: "" };
-    if (a.slot.nc > groups[k].nc) groups[k].nc = a.slot.nc;
-  });
-  Object.keys(groups).sort(function(x, y){ return groups[y].nc - groups[x].nc; })
-  .forEach(function(k){
-    var g = groups[k], i, off, y, x;
-    // 2a: vacated CLUT slots (16-aligned sub-offsets inside bigger spans)
-    for (i = 0; i < uniqFreedCluts.length && !g.dest; i++){
-      var fc = uniqFreedCluts[i];
-      if (fc.nc < g.nc) continue;
-      for (off = 0; off + g.nc <= fc.nc && !g.dest; off += 16)
-        if (clutFits(fc.cx + off, fc.cy, g.nc)){
-          g.dest = { cx: fc.cx + off, cy: fc.cy }; g.via = "freed clut";
-        }
-    }
-    // 2b: leftover rows inside the freed texture rects
-    for (i = 0; i < freedRects.length && !g.dest; i++){
-      var fr = freedRects[i];
-      var x0 = (fr.x + 15) & ~15;                       /* first 16-aligned x  */
-      for (y = fr.y; y < fr.y + fr.h && !g.dest; y++)
-        for (x = x0; x + g.nc <= fr.x + fr.w && !g.dest; x += 16)
-          if (clutFits(x, y, g.nc)){
-            g.dest = { cx: x, cy: y }; g.via = "freed-rect space";
+    // Integral (multilanguage) stages localization glyph data in the lower
+    // init band x768-960 y196-240: retail records nothing there despite ~95%
+    // packing pressure, and swapped textures whose SAMPLED texels fall in it
+    // corrupt in game (speckle = glyph writes). Textures merely dipping
+    // unused bottom rows into it can look fine — that is luck, not safety.
+    // JP-layout packs use the space freely — proven in game. Detect the
+    // layout by where resident cluts live: Integral below y240, JP at y240+.
+    // With the palette-backup EXE patch applied (backup block relocated from
+    // (768,196) to a dead VRAM corner), y196-226 becomes texture-safe; only
+    // the live clut rows y226-240 stay blocked. Unpatched: the full band.
+    var freshBlocked = integralLayout
+      ? (opts.paletteRelocated ? [{ px: 768, py: 226, vw: 192, h: 14 }]
+                               : [{ px: 768, py: 196, vw: 192, h: 44 }])
+      : [];
+
+    adds.forEach(function(a){
+      var s = a.slot, place, viaFreed = false, i;
+
+      place = fitInFreed(s);
+      if (place) viaFreed = true;
+      if (!place){
+        place = findFreeTexSlot(REGION_SAFE, freshBlocked.concat(occupied), cluts, s.vw, s.h, s.bpp);
+        if (place) res.warnings.push(a.name + ": placed OUTSIDE the freed footprint at (" +
+          place.px + "," + place.py + ") — the init region also hosts engine buffers " +
+          "not described in stage files; if this texture corrupts in game, free more space " +
+          "by removing additional resident textures");
+      }
+      if (!place){
+        res.overflow = true;
+        res.errors.push(a.name + ": no resident VRAM space for " + s.vw + "x" + s.h +
+          " (" + s.bpp + "bpp) — the freed footprint is full; remove more resident textures");
+        return;
+      }
+
+      // CLUT: one slot per palette group. Preference order:
+      //   1. freed slots (exact positions the removed set held — engine-proven,
+      //      pre-filtered above against sharing with kept textures)
+      //   2. free 16-aligned gaps in rows that recorded resident cluts occupy
+      //      (co-tenancy: the retail packer proved those rows engine-safe)
+      //   3. legacy full scan — record-free rows — with a loud warning, since
+      //      multilanguage builds stage font palettes in low record-free rows
+      var cl = null, viaFreedClut = false;
+      var g = groupClut[a.gid];
+      if (g){ cl = { cx: g.cx, cy: g.cy }; viaFreedClut = g.viaFreed; }
+      function clutFits(cc){
+        var k;
+        for (k = 0; k < cluts.length; k++) if (clutsOverlap(cc, cluts[k])) return false;
+        for (k = 0; k < occupied.length; k++)
+          if (rectsOverlap({ x: cc.cx, y: cc.cy, w: cc.nc, h: 1 }, texRect(occupied[k]))) return false;
+        return true;
+      }
+      if (!cl){
+        for (i = 0; i < freedCluts.length && !cl; i++){
+          var fc = freedCluts[i];
+          if (fc.nc < s.nc) continue;
+          /* 16-aligned sub-offsets inside the freed span, so e.g. a freed
+             256-entry clut can host up to sixteen 16-entry ones */
+          for (var off = 0; off + s.nc <= fc.nc && !cl; off += 16){
+            var cc = { cx: fc.cx + off, cy: fc.cy, nc: s.nc };
+            if (clutFits(cc)){ cl = { cx: cc.cx, cy: cc.cy }; viaFreedClut = true; }
           }
+        }
+      }
+      if (!cl){
+        /* tier 2: a 16x1 strip in fresh-texture-class VRAM — x640-960 ABOVE
+           the palette block (y<226), avoiding the glyph/backup band and the
+           codec column, with full collision checks. This is the same VRAM
+           class the plan's fresh TEXTURES use, and those are in-game proven
+           across stages (pixels render clean everywhere; only in-block
+           palette slots corrupt). Outside the block, palette effects
+           (caution flash, goggles) skip these palettes — cosmetic-only.
+           Bottom-up so strips tuck in just above the block. */
+        for (var sy = 225; sy >= 0 && !cl; sy--){
+          for (var sx = 640; sx + s.nc <= 960 && !cl; sx += 16){
+            /* GUARD MARGIN around the glyph/backup band (x768-960 y196-240):
+               its text-staging traffic is stage-dependent and can graze the
+               rows just ABOVE the nominal bound — strips at (848..928,195)
+               corrupted in s01a while s08b rendered clean (Liquid pants /
+               green-guard neck). No strips in the band's x-range within 8
+               rows of it: rows 188-225 at x>=768 are off-limits. Strips land
+               in the low-y free area instead, alongside the fresh texture
+               rects that are in-game proven across stages. */
+            if (sy >= 188 && sx + s.nc > 768) continue;
+            var cc2 = { cx: sx, cy: sy, nc: s.nc };
+            if (!clutFits(cc2)) continue;
+            var rr = { x: sx, y: sy, w: s.nc, h: 1 }, blockedHit = false, bi2;
+            for (bi2 = 0; bi2 < freshBlocked.length; bi2++)
+              if (rectsOverlap(rr, texRect(freshBlocked[bi2]))){ blockedHit = true; break; }
+            if (blockedHit) continue;
+            cl = { cx: sx, cy: sy };
+            res.warnings.push(a.name + ": CLUT placed above the palette block (" + sx + "," + sy +
+              ") in proven fresh-texture VRAM — safe in all stages; full-screen palette effects " +
+              "(caution flash, goggles) will not tint this palette (cosmetic-only tradeoff).");
+          }
+        }
+      }
+      if (!cl){ res.overflow = true; res.errors.push(a.name + ": no proven-safe CLUT slot available (freed slots and " +
+        "freed-footprint strips are full) — remove more resident textures to free slots"); return; }
+      if (!g) groupClut[a.gid] = { cx: cl.cx, cy: cl.cy, viaFreed: viaFreedClut };
+
+      var from = { px: s.px, py: s.py, cx: s.cx, cy: s.cy };
+      writePlacement(s, place.px, place.py, cl.cx, cl.cy);
+      occupied.push(s); cluts.push(s);
+      res.mapping.push({ name: a.name, hash: a.hash, w: s.vw, h: s.h, bpp: s.bpp,
+        from: from, to: { px: s.px, py: s.py, cx: s.cx, cy: s.cy },
+        viaFreedRect: viaFreed, viaFreedClut: viaFreedClut });
+    });
+
+    if (res.errors.length) return res;
+    res.ok = true;
+    return res;
+  }
+
+  // Retry driver: first-fit-decreasing is order-lucky — a large texture can
+  // fail while enough space sits fragmented behind smaller, earlier placements.
+  // On failure, promote the failed textures to the FRONT of the next attempt's
+  // packing order and re-run on fresh state. Converges or stops when no new
+  // names fail; returns the first clean attempt, else the best one seen.
+  function runRetry(){
+    var best = null, r, mode, attempt;
+    for (mode = 0; mode < 3; mode++){
+      var promoted = {};
+      for (attempt = 0; attempt < 8; attempt++){
+        r = attemptPlace(promoted, mode);
+        if (!r.errors.length){
+          if (mode > 0 || attempt > 0)
+            r.warnings.push("packing succeeded on sort-mode " + mode + ", attempt " + (attempt + 1) +
+              (Object.keys(promoted).length ? " after promoting: " + Object.keys(promoted).join(", ") : ""));
+          return r;
+        }
+        if (!best || r.errors.length < best.errors.length) best = r;
+        var grew = false;
+        r.errors.forEach(function(e){
+          var nm = e.split(":")[0];
+          if (!promoted[nm]){ promoted[nm] = 1; grew = true; }
+        });
+        if (!grew) break;
+      }
     }
-    if (!g.dest)
-      res.errors.push("palette group (" + k + ", " + g.nc + " colors): no engine-safe " +
-        "slot left even in freed-rect leftovers — check MORE resident textures for removal " +
-        "(Step 1) to widen the footprint.");
-    else
-      cluts.push({ cx: g.dest.cx, cy: g.dest.cy, nc: g.nc, px: -64, py: -64, vw: 0, h: 0 });
-  });
-  if (res.errors.length) return res;
-
-  // ── PHASE 3: write placements + mapping ──
-  placements.forEach(function(p){
-    var a = p.a, s = a.slot;
-    var g = groups[a._gkey];
-    var from = { px: s.px, py: s.py, cx: s.cx, cy: s.cy };
-    writePlacement(s, p.place.px, p.place.py, g.dest.cx, g.dest.cy);
-    res.mapping.push({ name: a.name, hash: a.hash, w: s.vw, h: s.h, bpp: s.bpp,
-      from: from, to: { px: s.px, py: s.py, cx: s.cx, cy: s.cy },
-      viaFreedRect: true, viaFreedClut: true, clutVia: g.via });
-  });
-
-  if (res.errors.length) return res;
-  res.ok = true;
-  return res;
+    return best;
+  }
+  // Two-pass palette budget: strict (dual-quantization) grouping first — if
+  // the plan is clean it is color-perfect. If it errors or spills CLUTs into
+  // record-free rows, retry with truncation-precision grouping (fewer bins;
+  // merged colors may shift ≤1 shade step) and keep whichever does better.
+  function spills(res){ if (!res) return 1e9;
+    return res.warnings.filter(function(w){ return /above the palette block/.test(w); }).length; }
+  var strict = runRetry();
+  if (strict && !strict.errors.length && !spills(strict)) return strict;
+  prepared = makePrepared(1);
+  var relaxed = runRetry();
+  var pick;
+  if (!relaxed) pick = strict;
+  else if (!strict) pick = relaxed;
+  else if (relaxed.errors.length !== strict.errors.length)
+    pick = relaxed.errors.length < strict.errors.length ? relaxed : strict;
+  else pick = spills(relaxed) < spills(strict) ? relaxed : strict;
+  if (pick === relaxed && relaxed)
+    relaxed.warnings.push("palette merging relaxed to truncation precision (merged colors may shift \\u22641 shade step) to fit the safe CLUT budget");
+  return pick;
 }
 
 // ── the swap plan ────────────────────────────────────────────────────────────
@@ -3050,7 +3792,54 @@ function SWAP_place(kept, removed, addFiles){
 // kmdSwap (optional): { ei, mi (-1 = loose entry), donorBytes } — the donor
 // character's KMD replaces the resident KMD IN PLACE, keeping the resident's
 // hash/name, so the game loads the new model under the old identity.
-function SWAP_plan(entries, removeSet, addFiles, kmdSwap){
+// ── Resident-fit assistance ─────────────────────────────────────────────────
+// Hashes that are GLOBAL props / engine assets, NOT part of any character —
+// the tool must never recommend deleting these to make room. Cardboard box,
+// radio/codec, ration, and the shared item/effect textures recur across the
+// whole game; removing them corrupts unrelated scenes. (Names are the MGS
+// strcode of the asset; extend as more are identified.)
+var SWAP_PROTECTED_HASHES = (function(){
+  var names = [
+    "cbox","box","danbo",       // cardboard box variants
+    "radio","codec","musen",    // codec / radio
+    "ration","raton",           // ration
+    "item","weapon","bullet",   // shared pickups / fx
+    "font","radar","soliton",   // HUD / map
+    "life","guage","gauge"      // status bars
+  ];
+  var set = {};
+  names.forEach(function(n){ set[SWAP_mgsHash(n)] = n; });
+  return set;
+})();
+
+function SWAP_isProtected(hash){ return !!SWAP_PROTECTED_HASHES[hash]; }
+
+// Rank resident textures as deletion candidates to free room for a failed fit.
+// Strategy: protect known-global hashes absolutely; among the rest, prefer the
+// LARGEST VRAM footprints first (fewest deletions to make room) while never
+// touching anything the swapped model's own KMD still references. Returns an
+// ordered list of {hash,name,bytes,protected,reason}.
+function SWAP_recommendDeletions(residentTexes, keepHashes, needBytes){
+  var cand = residentTexes.map(function(t){
+    var footprint = t.slot.vw * t.slot.h * (t.slot.bpp === 8 ? 1 : 0.5);
+    var prot = SWAP_isProtected(t.hash) || (keepHashes && keepHashes[t.hash]);
+    return { hash: t.hash, name: t.name || ("0x" + t.hash.toString(16)),
+             bytes: footprint, protected: prot,
+             reason: SWAP_isProtected(t.hash) ? "global asset (" + SWAP_PROTECTED_HASHES[t.hash] + ")"
+                     : (keepHashes && keepHashes[t.hash]) ? "used by the new model" : "" };
+  });
+  var deletable = cand.filter(function(c){ return !c.protected; })
+                      .sort(function(a,b){ return b.bytes - a.bytes; });
+  // greedily pick until we've freed >= needBytes (needBytes optional/heuristic)
+  var picked = [], freed = 0;
+  for (var i = 0; i < deletable.length; i++){
+    picked.push(deletable[i]); freed += deletable[i].bytes;
+    if (needBytes && freed >= needBytes) break;
+  }
+  return { recommended: picked, protected: cand.filter(function(c){ return c.protected; }) };
+}
+
+function SWAP_plan(entries, removeSet, addFiles, kmdSwap, opts){
   var res = { ok: false, entries: null, mapping: [], warnings: [], errors: [], stats: {} };
   var texes = SWAP_collectTextures(entries);
 
@@ -3059,19 +3848,42 @@ function SWAP_plan(entries, removeSet, addFiles, kmdSwap){
   if (!removed.length && removeSet.size)
     res.warnings.push("none of the selected hashes were found in this stage");
 
-  // duplicate-hash guard: an added hash must not collide with a KEPT texture
-  var keptHashes = {};
-  kept.forEach(function(t){ keptHashes[t.hash] = 1; });
-  addFiles.forEach(function(f){
-    if (keptHashes[f.hash])
-      res.errors.push("added 0x" + f.hash.toString(16) + " (" + f.name +
-        ") collides with a kept resident texture of the same hash");
+  // Shared-texture handling: donors often share files with the resident
+  // character (same pants/boots/etc = same name hash). Models reference
+  // textures BY HASH, so when an added hash already exists as a KEPT
+  // resident texture the add is simply unnecessary — the swapped model
+  // will find and use the resident copy. SKIP it with a note instead of
+  // failing the whole plan. If the donor's file differs from the resident
+  // copy, the RESIDENT version is what will show — warn accordingly.
+  var keptByHash = {};
+  kept.forEach(function(t){ keptByHash[t.hash] = t; });
+  addFiles = addFiles.filter(function(f){
+    var k = keptByHash[f.hash];
+    if (!k) return true;
+    var identical = k.bytes.length === f.bytes.length;
+    if (identical){
+      var i;
+      for (i = 0; i < f.bytes.length; i++)
+        if (f.bytes[i] !== k.bytes[i]){ identical = false; break; }
+    }
+    res.warnings.push("0x" + f.hash.toString(16) + " (" + f.name +
+      ") is shared with a kept resident texture \\u2014 skipped; the model uses the resident copy" +
+      (identical ? " (files are identical)" :
+        " (NOTE: donor file DIFFERS from the resident copy \\u2014 on-screen look follows the RESIDENT version; remove the resident texture too if you want the donor's)"));
+    return false;
   });
 
-  var placed = SWAP_place(kept, removed, addFiles);
+  // PSX wide resident region: the x960-1024 / y<226 strip is empty on retail
+  // PSX too (measured), so enable it here just like the PC path. Doubles the
+  // resident free space and lets small donor guns (e.g. Desert Eagle) fit
+  // without spilling to stages.
+  var _psxOpts = opts || {};
+  if (_psxOpts.wideInit === undefined) _psxOpts.wideInit = true;
+  var placed = SWAP_place(kept, removed, addFiles, _psxOpts);
   res.warnings = res.warnings.concat(placed.warnings);
   res.errors = res.errors.concat(placed.errors);
   res.mapping = placed.mapping;
+  if (placed.overflow) res.overflow = true;   /* surface the fit-failure flag */
   var adds = placed.adds;
   if (res.errors.length) return res;
 
@@ -3128,6 +3940,9 @@ function SWAP_plan(entries, removeSet, addFiles, kmdSwap){
 
   res.stats = { removed: removed.length, added: adds.length,
     container: targetDarEi >= 0 ? ("DAR entry #" + targetDarEi) : "loose entries" };
+  // ── EXTRA MODEL PAIRS (multi-swap): character + gun/etc. in one pass ──
+  // Each extra pair replaces a resident model in place, keeping its hash, exactly
+  // like the primary kmdSwap. Textures for these donors were added to the pool
   res.entries = newEntries;
   res.ok = true;
   return res;
@@ -3182,6 +3997,145 @@ function SWAP_kmdHashes(bytes){
     }
   }
   return out;
+}
+
+// Rewrite a KMD's texture-reference table in place: every face-ref equal to a
+// key in \`mapping\` (old hash) is replaced with its value (new hash). Same walk
+// as SWAP_kmdHashes, with stores. Returns the number of refs rewritten.
+function SWAP_kmdRehash(bytes, mapping){
+  var u32 = function(o){ return (bytes[o] | (bytes[o+1]<<8) | (bytes[o+2]<<16) | (bytes[o+3]<<24)) >>> 0; };
+  var n = u32(4), hits = 0;
+  if (n === 0 || n > 512) return 0;
+  for (var bi = 0; bi < n; bi++){
+    var bo = 0x20 + bi * 88;
+    if (bo + 88 > bytes.length) break;
+    var nf = u32(bo + 4), tno = u32(bo + 80);
+    if (!nf || nf > 50000 || !tno || tno >= bytes.length) continue;
+    for (var fi = 0; fi < nf; fi++){
+      var tp = tno + fi * 2;
+      if (tp + 2 > bytes.length) break;
+      var h = bytes[tp] | (bytes[tp+1] << 8);
+      if (h && mapping[h] !== undefined){
+        bytes[tp]   = mapping[h] & 0xFF;
+        bytes[tp+1] = (mapping[h] >> 8) & 0xFF;
+        hits++;
+      }
+    }
+  }
+  return hits;
+}
+
+// ── STAGE-DUPLICATE ANTI-COLLISION ──────────────────────────────────────────
+// The engine's texture registry resolves BY HASH, and stage packs can carry
+// the SAME hash as an added resident texture (vanilla characters appear in
+// stages for cutscenes: Liquid's textures ship inside s01a, d18a, s18a...).
+// When such a stage loads, its copy re-registers the hash and the player
+// model renders the STAGE's art/palette — the "green pants in some stages"
+// bug: corruption exactly in the stages whose packs duplicate the hash.
+// Fix: REHASH colliding adds to unique ids and patch the donor KMD's
+// reference table (the June "Snake-as-enemy" technique). \`stageHashes\` is a
+// Set of every hash present in any non-init stage; \`usedHashes\` everything
+// used anywhere (uniqueness pool).
+function SWAP_dedupeAddHashes(adds, kmdBytesList, stageHashes, usedHashes){
+  var mapping = {}, renamed = [];
+  var next = 0xE100;
+  function freshHash(){
+    while (usedHashes.has(next) || stageHashes.has(next)) next++;
+    usedHashes.add(next);
+    return next++;
+  }
+  adds.forEach(function(a){
+    if (!stageHashes.has(a.hash)) return;
+    var nh = freshHash();
+    mapping[a.hash] = nh;
+    renamed.push({ from: a.hash, to: nh, name: a.name });
+    a.hash = nh;
+    a.name = nh.toString(16).padStart(4, "0") + (a.name && a.name.indexOf(".") >= 0 ?
+      a.name.substring(a.name.indexOf(".")) : ".pcx");
+  });
+  var totalRefs = 0;
+  if (renamed.length && kmdBytesList){
+    kmdBytesList.forEach(function(kb){ if (kb) totalRefs += SWAP_kmdRehash(kb, mapping); });
+  }
+  return { mapping: mapping, renamed: renamed, refsPatched: totalRefs };
+}
+
+// ── PC stage-duplicate anti-collision ───────────────────────────────────────
+// Same failure as PSX: stage packs ship copies of character textures for
+// cutscene appearances, the engine registers BY HASH, so when such a stage
+// loads its copy re-registers the hash and the player model renders the
+// STAGE's art. PC identity is the NAME (hash = strcode(name)), so instead of
+// renaming to a hex hash we pick a fresh NAME whose strcode is unused, then
+// patch the donor KMD's reference table to the new hash.
+function SWAP_pcStageHashSets(pcFiles, currentStage, stageSegOf){
+  var stageHashes = new Set(), usedHashes = new Set();
+  pcFiles.forEach(function(f){
+    if (!/\\.dar$/i.test(f.path)) return;
+    var mem = pcDarParse(f.data); if (!mem) return;
+    var sn = stageSegOf(f.path);
+    mem.forEach(function(m){
+      if (!vramSlotOf(m.name, m.data)) return;
+      var hh = SWAP_mgsHash(SWAP_pcNameNoExt(m.name));
+      usedHashes.add(hh);
+      if (sn !== currentStage) stageHashes.add(hh);
+    });
+  });
+  return { stageHashes: stageHashes, usedHashes: usedHashes };
+}
+
+function SWAP_pcDedupeAddNames(adds, kmdBytesList, stageHashes, usedHashes){
+  var mapping = {}, renamed = [], ctr = 0;
+  function freshName(ext){
+    for (;;){
+      var nm = "zz" + ("000" + (ctr++).toString(36)).slice(-4);
+      var hh = SWAP_mgsHash(nm);
+      if (!usedHashes.has(hh) && !stageHashes.has(hh)){ usedHashes.add(hh); return { name: nm + ext, hash: hh }; }
+    }
+  }
+  adds.forEach(function(a){
+    if (!stageHashes.has(a.hash)) return;
+    var dot = a.name ? a.name.lastIndexOf(".") : -1;
+    var ext = dot >= 0 ? a.name.substring(dot) : ".pcx";
+    var fresh = freshName(ext);
+    mapping[a.hash] = fresh.hash;
+    renamed.push({ from: a.hash, to: fresh.hash, name: a.name, newName: fresh.name });
+    a.hash = fresh.hash; a.name = fresh.name;
+  });
+  var totalRefs = 0;
+  if (renamed.length && kmdBytesList){
+    kmdBytesList.forEach(function(kb){ if (kb) totalRefs += SWAP_kmdRehash(kb, mapping); });
+  }
+  return { mapping: mapping, renamed: renamed, refsPatched: totalRefs };
+}
+
+// ── PC alternate-model replacement ──────────────────────────────────────────
+// Stages carry their own copies of the player character for cutscenes
+// (sne_wet1..5 = wet/intro, sne_nude = torture, sne_bld1/2 = bloodied). A
+// resident swap doesn't touch them, so the old character still shows up in
+// those scenes. Mirror of the PSX "kmd-replace" method: overwrite each
+// stage-local member's KMD bytes with the resident donor KMD, keeping the
+// member's own NAME so everything referencing it now draws the new character.
+var SWAP_PC_ALT_MODELS = ["sne_wet1.kmd","sne_wet2.kmd","sne_wet3.kmd","sne_wet4.kmd",
+                          "sne_wet5.kmd","sne_nude.kmd","sne_bld1.kmd","sne_bld2.kmd"];
+function SWAP_pcReplaceAltModels(pcFiles, donorKmdBytes, names, stageSegOf){
+  var list = (names && names.length ? names : SWAP_PC_ALT_MODELS).map(function(s){ return s.toLowerCase(); });
+  var edits = {}, replaced = 0, stages = {}, which = {};
+  pcFiles.forEach(function(f){
+    if (!/\\.dar$/i.test(f.path)) return;
+    var mem = pcDarParse(f.data); if (!mem) return;
+    var hit = false;
+    var items = mem.map(function(m){
+      if (list.indexOf(m.name.toLowerCase()) >= 0){
+        hit = true; replaced++;
+        stages[stageSegOf ? stageSegOf(f.path) : f.path] = 1;
+        which[m.name] = (which[m.name] || 0) + 1;
+        return { name: m.name, bytes: donorKmdBytes };
+      }
+      return { name: m.name, bytes: m.data };
+    });
+    if (hit) edits[f.path] = pcDarBuild(items);
+  });
+  return { fileEdits: edits, replaced: replaced, stages: Object.keys(stages), which: which };
 }
 
 // ── guided-workflow helpers ──────────────────────────────────────────────────
@@ -3324,19 +4278,23 @@ function SWAP_pcPlan(files, removeSet, addFiles, kmdSwap){
   var removed = texes.filter(function(t){ return removeSet.has(t.hash); });
   var kept    = texes.filter(function(t){ return !removeSet.has(t.hash); });
   var keptHashes = {}; kept.forEach(function(t){ keptHashes[t.hash] = 1; });
-  addFiles.forEach(function(f){
-    if (keptHashes[f.hash])
-      res.errors.push("added " + f.name + " collides with a kept resident texture (same name hash)");
+  addFiles = addFiles.filter(function(f){
+    if (keptHashes[f.hash]){
+      res.warnings.push("added " + f.name + " is shared with a kept resident texture \\u2014 skipped; the model uses the resident copy");
+      return false;
+    }
     if (SWAP_mgsHash(SWAP_pcNameNoExt(f.name)) !== f.hash)
       res.warnings.push(f.name + ": file name does not strcode to 0x" + f.hash.toString(16) +
         " — on PC the NAME is the identity; the member will be stored under this name");
+    return true;
   });
   if (res.errors.length) return res;
 
-  var placed = SWAP_place(kept, removed, addFiles);
+  var placed = SWAP_place(kept, removed, addFiles, { wideInit: true });
   res.warnings = res.warnings.concat(placed.warnings);
   res.errors = res.errors.concat(placed.errors);
   res.mapping = placed.mapping;
+  if (placed.overflow) res.overflow = true;   /* surface the fit-failure flag */
   if (!placed.ok) return res;
   var adds = placed.adds;
 
@@ -3421,17 +4379,1068 @@ function SWAP_rebuildStage(headerB64, entries){
   return psxRebuildStage(b64FromBytes(header), entries);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CATALOG BATCH — single-donor resident swap over a whole STAGE.DIR
+// ═══════════════════════════════════════════════════════════════════════════
+// Port of resident_swap.py's batch model. Every listed character member has its
+// KMD overwritten with a RESIDENT donor model (default Snake 39213), keeping the
+// member's hash. NO textures move: the donor is already resident, so its VRAM is
+// untouched — the character just draws with the donor's already-loaded pages.
+// Catalog schema (identical to resident_swap.py's catalog.json):
+//   { "resident":"init.stg", "donor":39213,
+//     "stages": { "<name>": [ {"hash":H,"index":I,"method"?,"donor"?}, ... ] } }
+
+var SWAP_DONOR_DEFAULT = 39213;                 /* Snake */
+var SWAP_KMD_EXT = 0x6b, SWAP_GCX_EXT = 0x67, SWAP_CACHED_MODE = 0x63;
+
+// Pull a KMD by hash out of a resident stage's entries: a loose KMD entry
+// first, then any DAR member. Returns a private Uint8Array copy, or null.
+function SWAP_extractResidentKmd(residentEntries, donorHash){
+  var i, m, e, data;
+  for (i = 0; i < residentEntries.length; i++){
+    e = residentEntries[i]; data = e.data || e.bytes;
+    if (data && e.hash === donorHash && e.ext === SWAP_KMD_EXT) return new Uint8Array(data);
+  }
+  for (i = 0; i < residentEntries.length; i++){
+    e = residentEntries[i]; data = e.data || e.bytes;
+    if (!data || extName(e.ext) !== "dar") continue;
+    var members = psxDarParse(data);
+    if (!members) continue;
+    for (m = 0; m < members.length; m++)
+      if (members[m].hash === donorHash && members[m].ext === SWAP_KMD_EXT)
+        return new Uint8Array(members[m].data);
+  }
+  return null;
+}
+
+// Locate the character member (top-level entry): prefer the given index when it
+// hashes to the target, else the first KMD-typed match, else any non-marker
+// match. Mirrors resident_swap.py find_member.
+function SWAP_findMemberIndex(entries, memberHash, index){
+  if (index !== undefined && index !== null &&
+      index >= 0 && index < entries.length && entries[index].hash === memberHash)
+    return index;
+  var i;
+  for (i = 0; i < entries.length; i++)
+    if (entries[i].hash === memberHash && entries[i].ext === SWAP_KMD_EXT) return i;
+  for (i = 0; i < entries.length; i++)
+    if (entries[i].hash === memberHash && entries[i].ext !== 0xFF) return i;
+  return -1;
+}
+
+// kmd-replace, in place on a parsed entry list. Keeps hash/mode/ext, overwrites
+// the member's bytes with the donor KMD. Returns { ei, oldLen, newLen }.
+function SWAP_kmdReplaceEntry(entries, memberHash, donorKmd, index){
+  var ei = SWAP_findMemberIndex(entries, memberHash, index);
+  if (ei < 0) throw new Error("member hash 0x" + memberHash.toString(16) + " not found");
+  var e = entries[ei], old = e.data ? e.data.length : 0;
+  entries[ei] = { hash: e.hash, mode: e.mode, ext: e.ext, data: new Uint8Array(donorKmd) };
+  return { ei: ei, oldLen: old, newLen: donorKmd.length };
+}
+
+// Every \`04 06 <hash-BE>\` load across GCX (script) members. [patch-char]
+function SWAP_countLoads(entries, memberHash){
+  var hi = (memberHash >> 8) & 0xFF, lo = memberHash & 0xFF, hits = [], i, p;
+  for (i = 0; i < entries.length; i++){
+    if (entries[i].ext !== SWAP_GCX_EXT) continue;
+    var b = entries[i].data; if (!b) continue;
+    for (p = 0; p + 4 <= b.length; p++)
+      if (b[p] === 0x04 && b[p+1] === 0x06 && b[p+2] === hi && b[p+3] === lo)
+        hits.push({ ei: i, off: p });
+  }
+  return hits;
+}
+
+// patch-char: delete the model member and zero its single load instruction
+// (plus a preceding 50 xx setup pair when present). Returns { ei, scriptEi, off }.
+function SWAP_patchCharEntry(entries, memberHash, index){
+  var hits = SWAP_countLoads(entries, memberHash);
+  if (hits.length !== 1)
+    throw new Error("patch-char needs exactly 1 load for 0x" + memberHash.toString(16) +
+      ", found " + hits.length);
+  var ei = SWAP_findMemberIndex(entries, memberHash, index);
+  if (ei < 0) throw new Error("member hash 0x" + memberHash.toString(16) + " not found");
+  var h = hits[0], se = entries[h.ei], b = new Uint8Array(se.data);   /* private copy */
+  var start = h.off, ln = 4;
+  if (h.off >= 2 && b[h.off - 2] === 0x50){ start = h.off - 2; ln += 2; }
+  for (var k = 0; k < ln; k++) b[start + k] = 0;
+  entries[h.ei] = { hash: se.hash, mode: se.mode, ext: se.ext, data: b };
+  entries.splice(ei, 1);
+  return { ei: ei, scriptEi: h.ei, off: h.off };
+}
+
+// Apply one catalog stage's entry list to a parsed stage's entries, in place.
+// opts: { getDonor(hash)->Uint8Array|null, defaultDonor }. kmd-replaces run
+// first (no index shift), then patch-char deletions high-index-first so
+// survivors keep identity. Returns a results array.
+function SWAP_applyCatalogStage(entries, catEntries, opts){
+  var results = [], ops = [];
+  catEntries.forEach(function(e){
+    var donor = (e.donor !== undefined && e.donor !== null) ? (e.donor | 0)
+              : (opts.defaultDonor !== undefined && opts.defaultDonor !== null ? opts.defaultDonor : SWAP_DONOR_DEFAULT);
+    var method = e.method || "auto";
+    if (method === "auto") method = "kmd-replace";   /* a donor is always set here */
+    ops.push({ hash: (e.hash | 0), index: (e.index === undefined ? null : e.index),
+               method: method, donor: donor });
+  });
+
+  ops.filter(function(o){ return o.method === "kmd-replace"; }).forEach(function(o){
+    try{
+      var dk = opts.getDonor(o.donor);
+      if (!dk){ results.push({ hash: o.hash, status: "skipped-no-donor", donor: o.donor }); return; }
+      var r = SWAP_kmdReplaceEntry(entries, o.hash, dk, o.index);
+      results.push({ hash: o.hash, status: "kmd-replace", ei: r.ei,
+                     oldLen: r.oldLen, newLen: r.newLen, donor: o.donor });
+    }catch(ex){ results.push({ hash: o.hash, status: "error", error: ex.message }); }
+  });
+
+  ops.filter(function(o){ return o.method === "patch-char"; })
+     .sort(function(a, b){ return SWAP_findMemberIndex(entries, b.hash, b.index) -
+                                  SWAP_findMemberIndex(entries, a.hash, a.index); })
+     .forEach(function(o){
+    try{
+      var r = SWAP_patchCharEntry(entries, o.hash, o.index);
+      results.push({ hash: o.hash, status: "patch-char", ei: r.ei, scriptEi: r.scriptEi, off: r.off });
+    }catch(ex){ results.push({ hash: o.hash, status: "error", error: ex.message }); }
+  });
+
+  ops.filter(function(o){ return o.method !== "kmd-replace" && o.method !== "patch-char"; })
+     .forEach(function(o){ results.push({ hash: o.hash, status: "error",
+       error: "unknown method '" + o.method + "'" }); });
+
+  return results;
+}
+
+// Run a whole catalog over a loaded PSX STAGE.DIR (bytes). Rebuilds only the
+// touched stages (via SWAP_rebuildStage, which rewrites the config table so
+// patch-char deletions are safe) and leaves every other stage verbatim.
+// Returns { ok, rebuilt(Uint8Array), summary, resident, donor } or { ok:false, error }.
+function SWAP_runCatalogPsx(dirBytes, catalog, opts){
+  opts = opts || {};
+  if (!catalog || !catalog.stages) return { ok: false, error: 'catalog has no "stages" map' };
+  var outer = psxParseOuter(dirBytes), byName = {};
+  outer.stages.forEach(function(s){ byName[s.name] = s; });
+  function stripStg(n){ return String(n).replace(/\\.stg$/i, ""); }
+
+  var residentName = stripStg(catalog.resident || "init");
+  var defaultDonor = (opts.donor !== undefined && opts.donor !== null) ? (opts.donor | 0)
+                   : (catalog.donor !== undefined && catalog.donor !== null ? (catalog.donor | 0) : SWAP_DONOR_DEFAULT);
+
+  var rs = byName[residentName];
+  if (!rs) return { ok: false, error: "resident stage '" + residentName + "' not found in STAGE.DIR" };
+  var residentEntries = psxParseStage(dirBytes.subarray(rs.byteOff, rs.byteOff + rs.extent)).entries;
+
+  var donorCache = {};
+  function getDonor(dh){
+    if (dh === null || dh === undefined) dh = defaultDonor;
+    dh = dh | 0;
+    if (!(dh in donorCache)) donorCache[dh] = SWAP_extractResidentKmd(residentEntries, dh);
+    return donorCache[dh];
+  }
+
+  var blobs = {};
+  outer.stages.forEach(function(s){ blobs[s.name] = dirBytes.subarray(s.byteOff, s.byteOff + s.extent); });
+
+  // Which stages to run. opts.selected (array of names) wins when provided —
+  // that's the UI's tick list. Otherwise honor catalog.disabled (array of names
+  // the file itself opts out of). Names are matched with .stg stripped.
+  var selected = null;
+  if (opts.selected){ selected = {}; opts.selected.forEach(function(n){ selected[stripStg(n)] = true; }); }
+  var disabled = {};
+  (catalog.disabled || []).forEach(function(n){ disabled[stripStg(n)] = true; });
+
+  var summary = [];
+  Object.keys(catalog.stages).forEach(function(rawName){
+    var name = stripStg(rawName), s = byName[name];
+    if (selected ? !selected[name] : disabled[name]){ summary.push({ stage: name, status: "skipped" }); return; }
+    if (!s){ summary.push({ stage: name, status: "missing" }); return; }
+    var parsed = psxParseStage(dirBytes.subarray(s.byteOff, s.byteOff + s.extent));
+    var results = SWAP_applyCatalogStage(parsed.entries, catalog.stages[rawName],
+      { getDonor: getDonor, defaultDonor: defaultDonor });
+    var built = parsed.entries.map(function(e){
+      return { hash: e.hash, mode: e.mode, ext: e.ext, bytes: e.data ? e.data : new Uint8Array(0) };
+    });
+    blobs[name] = SWAP_rebuildStage(parsed.headerB64, built);
+    summary.push({ stage: name, results: results });
+  });
+
+  var rebuilt = psxRebuildDir({ psx: { headB64: outer.headB64, stages: outer.stages } }, blobs);
+  return { ok: true, rebuilt: rebuilt, summary: summary, resident: residentName, donor: defaultDonor };
+}
+
 if (typeof module !== "undefined") module.exports = {
   SWAP_mgsHash: SWAP_mgsHash, SWAP_hashFromFilename: SWAP_hashFromFilename,
+  SWAP_extractResidentKmd: SWAP_extractResidentKmd, SWAP_findMemberIndex: SWAP_findMemberIndex,
+  SWAP_kmdReplaceEntry: SWAP_kmdReplaceEntry, SWAP_countLoads: SWAP_countLoads,
+  SWAP_patchCharEntry: SWAP_patchCharEntry, SWAP_applyCatalogStage: SWAP_applyCatalogStage,
+  SWAP_runCatalogPsx: SWAP_runCatalogPsx,
   SWAP_collectTextures: SWAP_collectTextures, SWAP_plan: SWAP_plan,
   SWAP_verify: SWAP_verify, SWAP_kmdHashes: SWAP_kmdHashes,
   SWAP_looksLikeKmd: SWAP_looksLikeKmd, SWAP_listKmds: SWAP_listKmds,
   SWAP_place: SWAP_place, SWAP_pcCollect: SWAP_pcCollect, SWAP_pcListKmds: SWAP_pcListKmds,
   SWAP_pcRipFromFiles: SWAP_pcRipFromFiles, SWAP_pcPlan: SWAP_pcPlan, SWAP_verifyTexes: SWAP_verifyTexes,
   SWAP_findTexturesByHashes: SWAP_findTexturesByHashes, SWAP_ripFromStage: SWAP_ripFromStage,
-  SWAP_rebuildStage: SWAP_rebuildStage, SWAP_REGION_INIT: SWAP_REGION_INIT
+  SWAP_rebuildStage: SWAP_rebuildStage, SWAP_REGION_INIT: SWAP_REGION_INIT,
+  SWAP_paletteKey: SWAP_paletteKey, SWAP_pcxUsedIndices: SWAP_pcxUsedIndices,
+  SWAP_isProtected: SWAP_isProtected, SWAP_recommendDeletions: SWAP_recommendDeletions,
+  SWAP_distributeToStages: SWAP_distributeToStages, SWAP_PROTECTED_HASHES: SWAP_PROTECTED_HASHES,
+  SWAP_kmdRehash: SWAP_kmdRehash, SWAP_dedupeAddHashes: SWAP_dedupeAddHashes
 };
 
+
+// ── OPTION (B): distribute leftover textures into every s****/d**** stage ────
+// When a character's textures don't fit the resident area, pack the OVERFLOW
+// into each gameplay stage's own texture DAR so they load per-stage. This uses
+// the STAGE VRAM region (y>=256, x<960) — a SEPARATE memory area from the
+// resident/init region — and matches the Stage Editor's VRAM repacker exactly:
+//   - collect ALL existing stage-region textures across the WHOLE stage as
+//     fixed occupancy (not just the target DAR — the whole stage shares VRAM),
+//   - first-fit-decreasing placement, TPAGE-aligned (64 halfwords), within the
+//     stage region only,
+//   - stage CLUTs placed 16-aligned in the stage clut band, bottom-up,
+//   - verify no stage VRAM collision before committing; a texture that cannot
+//     be placed cleanly is SKIPPED (reported) rather than overlapped.
+//
+// Returns { stages:[{name,added,skipped,note}], darEdits:{ 'stage/ei': items } }
+function SWAP_distributeToStages(outerParsedByStage, overflowFiles, log){
+  var result = { stages: [], darEdits: {} };
+  var STAGE = VRAM_REGIONS.stage;   // {x1:0,y1:256,x2:960,y2:512}
+
+  function tpageBad(x, vw, bpp){ return crossesTPage(x, vw, bpp); }
+
+  // find a free (px,py) in the STAGE region avoiding \`occupied\` tex rects and
+  // \`clutRects\` — first-fit, X step 4, Y step 1, TPAGE-safe.
+  function findStageTex(occupied, clutRects, vw, h, bpp){
+    for (var y = STAGE.y1; y + h <= STAGE.y2; y++){
+      for (var x = STAGE.x1; x + vw <= STAGE.x2; x += 4){
+        if (tpageBad(x, vw, bpp)) continue;
+        var cand = { x: x, y: y, w: vw, h: h }, ok = true, i;
+        for (i = 0; i < occupied.length; i++)
+          if (rectsOverlap(cand, texRect(occupied[i]))){ ok = false; break; }
+        if (ok) for (i = 0; i < clutRects.length; i++)
+          if (rectsOverlap(cand, { x: clutRects[i].cx, y: clutRects[i].cy, w: clutRects[i].nc, h: 1 })){ ok = false; break; }
+        if (ok) return { px: x, py: y };
+      }
+    }
+    return null;
+  }
+  // stage CLUT band: 16-aligned x in [512,960), scanned bottom-up from y511.
+  function findStageClut(occupiedCluts, nc){
+    for (var y = STAGE.y2 - 1; y >= STAGE.y1; y--){
+      for (var x = 512; x + nc <= 960; x += 16){
+        var cand = { cx: x, cy: y, nc: nc }, ok = true;
+        for (var i = 0; i < occupiedCluts.length; i++)
+          if (clutsOverlap(cand, occupiedCluts[i])){ ok = false; break; }
+        if (ok) return { cx: x, cy: y };
+      }
+    }
+    return null;
+  }
+
+  var stageNames = Object.keys(outerParsedByStage).filter(function(n){ return /^[sd]\\d/i.test(n); });
+
+  stageNames.forEach(function(sname){
+    var entries = outerParsedByStage[sname].entries;
+
+    // Whole-stage occupancy: every texture + clut the stage already uses in the
+    // STAGE region, across ALL its DARs (this is what my per-DAR pass missed —
+    // the collisions came from ignoring sibling DARs sharing stage VRAM).
+    var fixedTex = [], fixedClut = [];
+    var texDars = [];
+    entries.forEach(function(e, ei){
+      if (extName(e.ext) !== "dar" || !e.data) return;
+      var members = psxDarParse(e.data); if (!members) return;
+      var texCount = 0;
+      members.forEach(function(m){
+        var s = vramSlotOf("x", m.data);
+        if (!s) return;
+        texCount++;
+        if (s.py >= 256){ fixedTex.push(s); }
+        if (s.nc > 0 && s.cy >= 256){ fixedClut.push({ cx: s.cx, cy: s.cy, nc: s.nc }); }
+      });
+      if (texCount > 0) texDars.push({ ei: ei, members: members, texCount: texCount });
+    });
+    if (!texDars.length){
+      result.stages.push({ name: sname, added: 0, skipped: overflowFiles.length, note: "no texture DAR" });
+      return;
+    }
+    // target DAR = the one with the most textures (the primary stage tex pack)
+    texDars.sort(function(a,b){ return b.texCount - a.texCount; });
+    var target = texDars[0];
+
+    // place overflow into stage VRAM, largest first
+    var toPlace = overflowFiles.map(function(f){
+      var s = vramSlotOf(f.name, f.bytes) || vramSlotOf("x", f.bytes);
+      return { file: f, slot: s };
+    }).filter(function(o){ return o.slot; })
+      .sort(function(a,b){ return (b.slot.vw*b.slot.h) - (a.slot.vw*a.slot.h); });
+
+    var occTex = fixedTex.slice(), occClut = fixedClut.slice();
+    var newMembers = [], skipped = 0;
+
+    toPlace.forEach(function(o){
+      // skip if this stage's target DAR already carries the hash (shared)
+      if (target.members.some(function(m){ return m.hash === o.file.hash; })) return;
+      var vw = o.slot.vw, h = o.slot.h, bpp = o.slot.bpp, nc = o.slot.nc;
+      var pos = findStageTex(occTex, occClut, vw, h, bpp);
+      if (!pos){ skipped++; if (log) log("    " + sname + ": no stage VRAM for 0x" + o.file.hash.toString(16), "warn"); return; }
+      var clut = null;
+      if (nc > 0){
+        clut = findStageClut(occClut, nc);
+        if (!clut){ skipped++; if (log) log("    " + sname + ": no stage CLUT for 0x" + o.file.hash.toString(16), "warn"); return; }
+      }
+      // write the placement into a COPY of the file bytes for this stage
+      var bytes = new Uint8Array(o.file.bytes);
+      var s2 = vramSlotOf("x", bytes);
+      writePlacement(s2, pos.px, pos.py, clut ? clut.cx : s2.cx, clut ? clut.cy : s2.cy);
+      // register as occupied so later placements in THIS stage avoid it
+      occTex.push({ px: pos.px, py: pos.py, vw: vw, h: h, bpp: bpp });
+      if (clut) occClut.push({ cx: clut.cx, cy: clut.cy, nc: nc });
+      newMembers.push({ hash: o.file.hash, ext: 0x70, bytes: bytes,
+                        name: "add_" + o.file.hash.toString(16) + ".pcc" });
+    });
+
+    if (!newMembers.length){
+      result.stages.push({ name: sname, added: 0, skipped: skipped, note: skipped ? "" : "already present" });
+      return;
+    }
+
+    // assemble the rebuilt member list: existing members verbatim + new ones
+    var items = target.members.map(function(m, j){
+      return { hash: m.hash, ext: m.ext, bytes: m.data };
+    });
+    newMembers.forEach(function(nm){ items.push({ hash: nm.hash, ext: nm.ext, bytes: nm.bytes }); });
+
+    // FINAL verify: no two stage-region textures/cluts in this DAR collide
+    var vslots = [];
+    items.forEach(function(it){ var s = vramSlotOf("x", it.bytes); if (s && s.py >= 256) vslots.push(s); });
+    var collision = false;
+    for (var a = 0; a < vslots.length && !collision; a++)
+      for (var b = a + 1; b < vslots.length; b++){
+        if (vslots[a].px === vslots[b].px && vslots[a].py === vslots[b].py) continue;
+        if (rectsOverlap(texRect(vslots[a]), texRect(vslots[b]))){ collision = true; break; }
+      }
+    if (collision){
+      result.stages.push({ name: sname, added: 0, skipped: overflowFiles.length, note: "verify failed — skipped" });
+      if (log) log("    " + sname + ": post-pack collision detected, stage skipped", "err");
+      return;
+    }
+
+    result.darEdits[sname + "/" + target.ei] = items;
+    result.stages.push({ name: sname, added: newMembers.length, skipped: skipped });
+  });
+  return result;
+}
+
+// ── PC overflow → stages (parallel to SWAP_distributeToStages, PC container) ──
+// PSX edits stage blobs inside the outer STAGE.DIR; PC stages are loose files in
+// the zip (stage/<name>/*.dar), so this returns whole-file edits {path:bytes}
+// that the PC execute path zips in place of the originals. Placement math is the
+// same STAGE-region fitter; only parse/rebuild differ (name-keyed pcDar*).
+function SWAP_pcDistributeToStages(pcFiles, overflowFiles, stageSegOf, log){
+  var result = { stages: [], fileEdits: {} };
+  var STAGE = VRAM_REGIONS.stage;   // {x1:0,y1:256,x2:960,y2:512}
+
+  function findStageTex(occupied, clutRects, vw, h, bpp){
+    for (var y = STAGE.y1; y + h <= STAGE.y2; y++){
+      for (var x = STAGE.x1; x + vw <= STAGE.x2; x += 4){
+        if (crossesTPage(x, vw, bpp)) continue;
+        var cand = { x: x, y: y, w: vw, h: h }, ok = true, i;
+        for (i = 0; i < occupied.length; i++)
+          if (rectsOverlap(cand, texRect(occupied[i]))){ ok = false; break; }
+        if (ok) for (i = 0; i < clutRects.length; i++)
+          if (rectsOverlap(cand, { x: clutRects[i].cx, y: clutRects[i].cy, w: clutRects[i].nc, h: 1 })){ ok = false; break; }
+        if (ok) return { px: x, py: y };
+      }
+    }
+    return null;
+  }
+  function findStageClut(occupiedCluts, nc, occupiedTex){
+    // A CLUT occupies one VRAM row of \`nc\` entries. It must avoid other CLUTs AND
+    // every stage texture. The original only checked CLUTs, so overflow CLUTs were
+    // placed on top of live stage textures -> visible texture corruption.
+    for (var y = STAGE.y2 - 1; y >= STAGE.y1; y--){
+      for (var x = 512; x + nc <= 960; x += 16){
+        var cand = { cx: x, cy: y, nc: nc }, ok = true, i;
+        for (i = 0; i < occupiedCluts.length; i++)
+          if (clutsOverlap(cand, occupiedCluts[i])){ ok = false; break; }
+        if (ok && occupiedTex){
+          var cr = { x: x, y: y, w: nc, h: 1 };
+          for (i = 0; i < occupiedTex.length; i++)
+            if (rectsOverlap(cr, texRect(occupiedTex[i]))){ ok = false; break; }
+        }
+        if (ok) return { cx: x, cy: y };
+      }
+    }
+    return null;
+  }
+
+  // group pc files by stage segment, keep only s##/d## gameplay stages
+  var byStage = {};
+  pcFiles.forEach(function(f){
+    var sn = stageSegOf(f.path);
+    if (!/^[sd]\\d/i.test(sn)) return;
+    (byStage[sn] = byStage[sn] || []).push(f);
+  });
+
+  Object.keys(byStage).forEach(function(sname){
+    var stageFiles = byStage[sname];
+
+    // whole-stage occupancy across ALL this stage's DARs (STAGE region only)
+    var fixedTex = [], fixedClut = [];
+    var texDars = [];    // {path, members:[{name,data}], texCount}
+    stageFiles.forEach(function(f){
+      if (!/\\.dar$/i.test(f.path)) return;
+      var members = pcDarParse(f.data); if (!members) return;
+      var texCount = 0;
+      members.forEach(function(m){
+        var s = vramSlotOf(m.name, m.data);
+        if (!s) return;
+        texCount++;
+        if (s.py >= 256){ fixedTex.push(s); }
+        if (s.nc > 0 && s.cy >= 256){ fixedClut.push({ cx: s.cx, cy: s.cy, nc: s.nc }); }
+      });
+      if (texCount > 0) texDars.push({ path: f.path, members: members, texCount: texCount });
+    });
+    if (!texDars.length){
+      result.stages.push({ name: sname, added: 0, skipped: overflowFiles.length, note: "no texture DAR" });
+      return;
+    }
+    texDars.sort(function(a,b){ return b.texCount - a.texCount; });
+    var target = texDars[0];
+
+    var toPlace = overflowFiles.map(function(f){
+      var s = vramSlotOf(f.name, f.bytes) || vramSlotOf("x", f.bytes);
+      return { file: f, slot: s };
+    }).filter(function(o){ return o.slot; })
+      .sort(function(a,b){ return (b.slot.vw*b.slot.h) - (a.slot.vw*a.slot.h); });
+
+    var occTex = fixedTex.slice(), occClut = fixedClut.slice();
+    var newMembers = [], skipped = 0;
+
+    toPlace.forEach(function(o){
+      // on PC identity is the NAME: skip if the target DAR already carries it
+      if (target.members.some(function(m){ return m.name === o.file.name; })) return;
+      var vw = o.slot.vw, h = o.slot.h, bpp = o.slot.bpp, nc = o.slot.nc;
+      var pos = findStageTex(occTex, occClut, vw, h, bpp);
+      if (!pos){ skipped++; if (log) log("    " + sname + ": no stage VRAM for " + o.file.name, "warn"); return; }
+      var clut = null;
+      if (nc > 0){
+        clut = findStageClut(occClut, nc, occTex);
+        if (!clut){ skipped++; if (log) log("    " + sname + ": no stage CLUT for " + o.file.name, "warn"); return; }
+      }
+      var bytes = new Uint8Array(o.file.bytes);
+      var s2 = vramSlotOf(o.file.name, bytes) || vramSlotOf("x", bytes);
+      writePlacement(s2, pos.px, pos.py, clut ? clut.cx : s2.cx, clut ? clut.cy : s2.cy);
+      occTex.push({ px: pos.px, py: pos.py, vw: vw, h: h, bpp: bpp });
+      if (clut) occClut.push({ cx: clut.cx, cy: clut.cy, nc: nc });
+      newMembers.push({ name: o.file.name, bytes: bytes });
+    });
+
+    if (!newMembers.length){
+      result.stages.push({ name: sname, added: 0, skipped: skipped, note: skipped ? "" : "already present" });
+      return;
+    }
+
+    // rebuild target DAR: existing members verbatim + new named members
+    var items = target.members.map(function(m){ return { name: m.name, bytes: m.data }; });
+    newMembers.forEach(function(nm){ items.push({ name: nm.name, bytes: nm.bytes }); });
+
+    // FINAL verify: no two STAGE-region textures in this DAR overlap
+    var vslots = [];
+    items.forEach(function(it){ var s = vramSlotOf(it.name, it.bytes); if (s && s.py >= 256) vslots.push(s); });
+    var collision = false;
+    for (var a = 0; a < vslots.length && !collision; a++)
+      for (var b = a + 1; b < vslots.length; b++){
+        if (vslots[a].px === vslots[b].px && vslots[a].py === vslots[b].py) continue;
+        if (rectsOverlap(texRect(vslots[a]), texRect(vslots[b]))){ collision = true; break; }
+      }
+    if (collision){
+      result.stages.push({ name: sname, added: 0, skipped: overflowFiles.length, note: "verify failed \\u2014 skipped" });
+      if (log) log("    " + sname + ": post-pack collision detected, stage skipped", "err");
+      return;
+    }
+
+    result.fileEdits[target.path] = pcDarBuild(items);
+    result.stages.push({ name: sname, added: newMembers.length, skipped: skipped });
+  });
+  return result;
+}
+<\/script>
+<script>// ── KMD ↔ GLB pipeline ───────────────────────────────────────────────────────
+// Export a KMD (+ its DAR textures) to a self-contained .glb, and re-import an
+// edited .glb back into the original KMD's binary structure. The KMD block
+// layout matches the suite's parser (04_textures.js): blocks at 0x20 + 88*i,
+// verts int16*4 @ desc+56 (count @ +52), faces u8*4 @ +60 (count @ +4),
+// UVs u8*8 @ +76, texhash u16 @ +80. GLB import writes vertices/UVs back into
+// those exact spans — topology is preserved, so edits are geometry+UV only.
+
+var KMD_SCALE = 1;   // keep native units; the importer inverts consistently
+
+function KMD_parseBlocks(bytes){
+  var v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  var d = bytes;
+  var n = v.getUint32(4, true);
+  if (n === 0 || n > 512) return null;
+  // bone world positions (localPos + parent chain) — matches KmdModel.GetObjectPosition
+  var boneWP = [];
+  for (var kb = 0; kb < n; kb++){
+    var ko = 0x20 + kb * 88;
+    if (ko + 0x30 > bytes.length){ boneWP.push([0,0,0]); continue; }
+    var kw = [v.getInt32(ko+0x20,true), v.getInt32(ko+0x24,true), v.getInt32(ko+0x28,true)];
+    var kp = v.getInt32(ko+0x2C, true);
+    if (kp >= 0 && kp < boneWP.length){ kw[0]+=boneWP[kp][0]; kw[1]+=boneWP[kp][1]; kw[2]+=boneWP[kp][2]; }
+    boneWP.push(kw);
+  }
+  var blocks = [];
+  for (var bi = 0; bi < n; bi++){
+    var bo = 0x20 + bi * 88;
+    if (bo + 88 > bytes.length) break;
+    // header fields (exact Mint offsets)
+    var nf   = v.getUint32(bo+0x04,true);          // FaceCount
+    var nv   = v.getUint32(bo+0x34,true);          // VertexCount
+    var vo   = v.getUint32(bo+0x38,true);          // VertexCoordOffset
+    var voo  = v.getUint32(bo+0x3C,true);          // VertexOrderOffset
+    var nnc  = v.getUint32(bo+0x40,true);          // NormalVertexCount
+    var nco  = v.getUint32(bo+0x44,true);          // NormalVertexCoordOffset
+    var noo  = v.getUint32(bo+0x48,true);          // NormalVertexOrderOffset
+    var uvo  = v.getUint32(bo+0x4C,true);          // UVOffset
+    var tno  = v.getUint32(bo+0x50,true);          // TextureNameOffset
+    var bw = boneWP[bi] || [0,0,0];
+    var block = { idx: bi, nv:nv, vo:vo, voo:voo, nf:nf, uvo:uvo, tno:tno,
+                  nnc:nnc, nco:nco, noo:noo, bw:bw,
+                  verts:[], normals:[], faces:[] };
+    // vertex coords: Vector4Int16 (X,Y,Z,W) — we take XYZ
+    if (nv>0 && nv<50000 && vo + nv*8 <= bytes.length){
+      for (var vi=0; vi<nv; vi++){ var vp=vo+vi*8;
+        block.verts.push([ v.getInt16(vp,true), v.getInt16(vp+2,true), v.getInt16(vp+4,true) ]); }
+    }
+    // normal coords: Vector4Int16
+    if (nnc>0 && nnc<50000 && nco + nnc*8 <= bytes.length){
+      for (var ni=0; ni<nnc; ni++){ var np=nco+ni*8;
+        block.normals.push([ v.getInt16(np,true), v.getInt16(np+2,true), v.getInt16(np+4,true) ]); }
+    }
+    // per-face: vertex order (4×u8), normal order (4×u8), UVs (4× Vector2UInt8), texhash (u16)
+    if (nf>0 && nf<50000){
+      for (var fi=0; fi<nf; fi++){
+        var face = { i:[0,0,0,0], ni:[0,0,0,0], uv:[0,0,0,0,0,0,0,0], hash:0 };
+        var fp = voo + fi*4;
+        if (fp+4<=bytes.length) face.i = [ d[fp],d[fp+1],d[fp+2],d[fp+3] ];
+        var mp = noo + fi*4;
+        if (mp+4<=bytes.length) face.ni = [ d[mp]&0x7F, d[mp+1]&0x7F, d[mp+2]&0x7F, d[mp+3]&0x7F ];
+        // UVs: FaceCount*4 entries, 2 bytes each, sequential (x advances per corner)
+        var up = uvo + fi*8;
+        if (up+8<=bytes.length) face.uv = [ d[up],d[up+1],d[up+2],d[up+3],d[up+4],d[up+5],d[up+6],d[up+7] ];
+        if (tno + fi*2 + 2 <= bytes.length) face.hash = v.getUint16(tno+fi*2, true);
+        block.faces.push(face);
+      }
+    }
+    blocks.push(block);
+  }
+  return { n:n, blocks:blocks };
+}
+
+// Build a GLB from a KMD + a texture map {hash:{png:Uint8Array}}, WITH a full
+// glTF skeleton: 16 joint nodes in the KMD bone hierarchy, a skin, and rigid
+// per-vertex bone binding (each block's geometry weights 100% to its own bone).
+// Matches what the MMS/Noesis pipeline produces: armature + mesh + textures.
+function KMD_toGLB(kmdBytes, texMap){
+  var parsed = KMD_parseBlocks(kmdBytes);
+  if (!parsed) throw new Error("not a KMD");
+  var v = new DataView(kmdBytes.buffer, kmdBytes.byteOffset, kmdBytes.byteLength);
+
+  // ---- bone rig: localPos + parent, and accumulated world positions ----
+  var bones = [];
+  for (var bi = 0; bi < parsed.n; bi++){
+    var bo = 0x20 + bi * 88;
+    bones.push({
+      idx: bi,
+      parent: v.getInt32(bo + 0x2C, true),
+      local: [ v.getInt32(bo + 0x20, true), v.getInt32(bo + 0x24, true), v.getInt32(bo + 0x28, true) ]
+    });
+  }
+
+  // ---- geometry grouped by texture hash, but each vertex tagged with its
+  //      source BONE so we can emit JOINTS_0/WEIGHTS_0 (rigid skinning) ----
+  var groups = {};   // hash -> {pos:[], nrm:[], uv:[], joint:[], weight:[], idx:[]}
+  parsed.blocks.forEach(function(b){
+    var bone = b.idx;   // KMD: block i binds to bone i, one bone per vertex
+    b.faces.forEach(function(f){
+      var h = f.hash;
+      if (!groups[h]) groups[h] = { pos:[], nrm:[], uv:[], joint:[], weight:[], idx:[] };
+      var g = groups[h];
+      // 4 corners: position (+bone world), normal (÷4096, NEGATED — Mint), UV (÷256)
+      var corner = [];
+      for (var k = 0; k < 4; k++){
+        var vt = b.verts[f.i[k]] || [0,0,0];
+        var nm = b.normals[f.ni[k]] || [0,0,0];
+        corner.push({
+          p: [ vt[0]+b.bw[0], vt[1]+b.bw[1], vt[2]+b.bw[2] ],
+          n: [ -nm[0]/4096, -nm[1]/4096, -nm[2]/4096 ],
+          u: [ f.uv[k*2]/256, f.uv[k*2+1]/256 ]
+        });
+      }
+      // Mint winding: AddQuadrangle(v4,v3,v2,v1) → emit corners in REVERSED order
+      var order = [3,2,1,0];
+      var base = g.pos.length / 3;
+      order.forEach(function(ci){
+        var c = corner[ci];
+        g.pos.push(c.p[0],c.p[1],c.p[2]);
+        g.nrm.push(c.n[0],c.n[1],c.n[2]);
+        g.uv.push(c.u[0],c.u[1]);
+        g.joint.push(bone,0,0,0);
+        g.weight.push(1,0,0,0);
+      });
+      // quad → 2 tris on the reversed-corner buffer
+      g.idx.push(base+0,base+1,base+2, base+0,base+2,base+3);
+    });
+  });
+
+  var bin = [], views = [], accessors = [], materials = [], meshPrims = [], images = [], textures = [], samplers = [{}];
+  function align4(arr){ while (arr.length % 4) arr.push(0); }
+  function pushView(bytesArr, target){
+    var off = bin.length; for (var i=0;i<bytesArr.length;i++) bin.push(bytesArr[i]); align4(bin);
+    views.push({ buffer:0, byteOffset:off, byteLength:bytesArr.length, target:target });
+    return views.length - 1;
+  }
+  function f32bytes(arr){ var b=new Uint8Array(arr.length*4),dv=new DataView(b.buffer);
+    for(var i=0;i<arr.length;i++)dv.setFloat32(i*4,arr[i],true); return b; }
+  function u16bytes(arr){ var b=new Uint8Array(arr.length*2),dv=new DataView(b.buffer);
+    for(var i=0;i<arr.length;i++)dv.setUint16(i*2,arr[i],true); return b; }
+  function u8x4bytes(arr){ return new Uint8Array(arr); }
+  function minmax(arr,comp){ var mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];
+    for(var i=0;i<arr.length;i+=comp)for(var c=0;c<comp;c++){var val=arr[i+c];if(val<mn[c])mn[c]=val;if(val>mx[c])mx[c]=val;}
+    return {min:mn.slice(0,comp),max:mx.slice(0,comp)}; }
+
+  Object.keys(groups).forEach(function(hStr){
+    var g = groups[hStr], h = +hStr;
+    if (!g.pos.length) return;
+    var posView = pushView(f32bytes(g.pos), 34962);
+    var nrmView = pushView(f32bytes(g.nrm), 34962);
+    var uvView  = pushView(f32bytes(g.uv), 34962);
+    var jntView = pushView(u16bytes(g.joint), 34962);
+    var wgtView = pushView(f32bytes(g.weight), 34962);
+    var idxView = pushView(u16bytes(g.idx), 34963);
+    var mm = minmax(g.pos, 3);
+    var posAcc = accessors.length;
+    accessors.push({ bufferView:posView, componentType:5126, count:g.pos.length/3, type:"VEC3", min:mm.min, max:mm.max });
+    var nrmAcc = accessors.length;
+    accessors.push({ bufferView:nrmView, componentType:5126, count:g.nrm.length/3, type:"VEC3" });
+    var uvAcc = accessors.length;
+    accessors.push({ bufferView:uvView, componentType:5126, count:g.uv.length/2, type:"VEC2" });
+    var jntAcc = accessors.length;
+    accessors.push({ bufferView:jntView, componentType:5123, count:g.joint.length/4, type:"VEC4" });
+    var wgtAcc = accessors.length;
+    accessors.push({ bufferView:wgtView, componentType:5126, count:g.weight.length/4, type:"VEC4" });
+    var idxAcc = accessors.length;
+    accessors.push({ bufferView:idxView, componentType:5123, count:g.idx.length, type:"SCALAR" });
+
+    var matIdx = materials.length;
+    var mat = { name:"tex_"+h.toString(16), pbrMetallicRoughness:{ metallicFactor:0, roughnessFactor:1 },
+                alphaMode:"OPAQUE", doubleSided:true, extras:{ kmdTexHash:h } };
+    if (texMap && texMap[h] && texMap[h].png){
+      var imgView = pushView(texMap[h].png, undefined);
+      images.push({ bufferView:imgView, mimeType:"image/png" });
+      textures.push({ source:images.length-1, sampler:0 });
+      mat.pbrMetallicRoughness.baseColorTexture = { index: textures.length-1 };
+    }
+    materials.push(mat);
+    meshPrims.push({ attributes:{ POSITION:posAcc, NORMAL:nrmAcc, TEXCOORD_0:uvAcc, JOINTS_0:jntAcc, WEIGHTS_0:wgtAcc },
+                     indices:idxAcc, material:matIdx });
+  });
+
+  // ---- glTF node graph: skeleton joints + a skinned mesh node ----
+  // node 0 = mesh (skinned); nodes 1..n = joints in bone order.
+  var nodes = [];
+  nodes.push({ name:"kmd", mesh:0, skin:0 });   // node 0
+  var jointNodeBase = 1;
+  bones.forEach(function(bn, i){
+    var node = { name:"bone_"+i, translation:[ bn.local[0], bn.local[1], bn.local[2] ] };
+    nodes.push(node);
+  });
+  // wire children by parent
+  bones.forEach(function(bn, i){
+    if (bn.parent >= 0 && bn.parent < bones.length){
+      var pn = nodes[jointNodeBase + bn.parent];
+      (pn.children = pn.children || []).push(jointNodeBase + i);
+    }
+  });
+  // scene roots: mesh node + every bone whose parent is -1 (root bones)
+  var sceneNodes = [0];
+  bones.forEach(function(bn, i){ if (bn.parent < 0) sceneNodes.push(jointNodeBase + i); });
+
+  // inverse bind matrices: inverse of each joint's WORLD translation (rigid,
+  // no rotation) so the skin neutralizes the bone's world offset — the mesh is
+  // already in world space, so IBM = translate(-worldPos)
+  var ibm = [];
+  parsed.blocks; // (world positions computed in KMD_parseBlocks as b.bw)
+  var boneWorld = [];
+  bones.forEach(function(bn, i){
+    var w = bn.local.slice();
+    if (bn.parent >= 0 && bn.parent < boneWorld.length){ w[0]+=boneWorld[bn.parent][0]; w[1]+=boneWorld[bn.parent][1]; w[2]+=boneWorld[bn.parent][2]; }
+    boneWorld.push(w);
+  });
+  boneWorld.forEach(function(w){
+    // column-major 4x4, translation = -w
+    ibm.push(1,0,0,0, 0,1,0,0, 0,0,1,0, -w[0],-w[1],-w[2],1);
+  });
+  var ibmView = pushView(f32bytes(ibm), undefined);
+  var ibmAcc = accessors.length;
+  accessors.push({ bufferView:ibmView, componentType:5126, count:bones.length, type:"MAT4" });
+  var joints = bones.map(function(bn,i){ return jointNodeBase + i; });
+  var skins = [{ inverseBindMatrices: ibmAcc, joints: joints, skeleton: jointNodeBase }];
+
+  var gltf = {
+    asset:{ version:"2.0", generator:"MGS1 Archive Tool KMD exporter (skinned)" },
+    scene:0, scenes:[{ nodes: sceneNodes }],
+    nodes: nodes,
+    meshes:[{ primitives: meshPrims }],
+    skins: skins,
+    materials: materials, accessors: accessors, bufferViews: views,
+    buffers:[{ byteLength: bin.length }], samplers: samplers,
+    extras:{ kmdBlockCount: parsed.n }
+  };
+  if (images.length) gltf.images = images;
+  if (textures.length) gltf.textures = textures;
+
+  var jsonBytes = new TextEncoder().encode(JSON.stringify(gltf));
+  while (jsonBytes.length % 4) jsonBytes = concatU8(jsonBytes, new Uint8Array([0x20]));
+  var binBytes = new Uint8Array(bin);
+  while (binBytes.length % 4) binBytes = concatU8(binBytes, new Uint8Array([0]));
+  var total = 12 + 8 + jsonBytes.length + 8 + binBytes.length;
+  var out = new Uint8Array(total), dv = new DataView(out.buffer);
+  dv.setUint32(0,0x46546C67,true); dv.setUint32(4,2,true); dv.setUint32(8,total,true);
+  dv.setUint32(12,jsonBytes.length,true); dv.setUint32(16,0x4E4F534A,true);
+  out.set(jsonBytes,20);
+  var bh = 20 + jsonBytes.length;
+  dv.setUint32(bh,binBytes.length,true); dv.setUint32(bh+4,0x004E4942,true);
+  out.set(binBytes, bh+8);
+  return out;
+}
+
+function concatU8(a, b){ var c = new Uint8Array(a.length + b.length); c.set(a); c.set(b, a.length); return c; }
+
+// Re-encode an edited GLB into a NEW KMD, using the original KMD only for its
+// per-bone metadata (bitflags, extend, parent, bone position). Geometry is
+// rebuilt from scratch, so faces/verts CAN be added or deleted — matching
+// Mint\\'s KmdImporter.FromGltf. Triangles are grouped by skin joint (bone);
+// each object dedups its vertex + normal lists and writes fresh tables.
+function GLB_toKMD(glbBytes, originalKmdBytes){
+  var orig = new Uint8Array(originalKmdBytes);
+  var ov = new DataView(orig.buffer, orig.byteOffset, orig.byteLength);
+  var boneCount = ov.getUint32(4, true);
+  if (boneCount === 0 || boneCount > 512) throw new Error("original is not a KMD");
+
+  // per-bone metadata from the original header
+  var meta = [];
+  for (var bi = 0; bi < boneCount; bi++){
+    var bo = 0x20 + bi * 88;
+    meta.push({
+      bitflags: ov.getUint32(bo+0x00, true),
+      bbStart:  [ov.getInt32(bo+0x08,true), ov.getInt32(bo+0x0C,true), ov.getInt32(bo+0x10,true)],
+      bbEnd:    [ov.getInt32(bo+0x14,true), ov.getInt32(bo+0x18,true), ov.getInt32(bo+0x1C,true)],
+      bonePos:  [ov.getInt32(bo+0x20,true), ov.getInt32(bo+0x24,true), ov.getInt32(bo+0x28,true)],
+      parent:   ov.getInt32(bo+0x2C, true),
+      extend:   ov.getUint32(bo+0x30, true),
+      padding:  ov.getUint32(bo+0x54, true)
+    });
+  }
+  // bone world positions
+  var boneWP = [];
+  meta.forEach(function(m, i){
+    var w = m.bonePos.slice();
+    if (m.parent >= 0 && m.parent < boneWP.length){ w[0]+=boneWP[m.parent][0]; w[1]+=boneWP[m.parent][1]; w[2]+=boneWP[m.parent][2]; }
+    boneWP.push(w);
+  });
+
+  // decode the GLB into triangles tagged with bone (skin joint) + material hash
+  var g = parseGLBFull(glbBytes);
+
+  // per-object accumulators
+  var objs = [];
+  for (var oi = 0; oi < boneCount; oi++){
+    objs.push({ verts: [], vkey: {}, norms: [], nkey: {},
+                vorder: [], norder: [], uv: [], hash: [] });
+  }
+  function idxOfAdd(list, keymap, x, y, z){
+    var k = x + "," + y + "," + z;
+    if (keymap[k] !== undefined) return keymap[k];
+    var id = list.length; list.push([x,y,z]); keymap[k] = id; return id;
+  }
+
+  g.triangles.forEach(function(tri){
+    var bone = tri.bone;
+    if (bone < 0 || bone >= boneCount) bone = 0;
+    var o = objs[bone];
+    var wp = boneWP[bone];
+    // KMD stores a quad per face; a triangle → degenerate quad (A,B,B,C) exactly
+    // like Mint\\'s TryAddTriangle. Corners are written in order D,C,B,A (Mint).
+    var quad;
+    if (tri.quad){ quad = [ tri.v[0], tri.v[1], tri.v[2], tri.v[3] ]; }
+    else { quad = [ tri.v[0], tri.v[1], tri.v[1], tri.v[2] ]; }   // degenerate
+    var order = [3,2,1,0];                  // write D,C,B,A
+    var vord = [], nord = [];
+    order.forEach(function(qi){
+      var c = quad[qi];
+      // position in OBJECT space (world - bone world), rounded int16
+      var vx = Math.round(c.p[0] - wp[0]), vy = Math.round(c.p[1] - wp[1]), vz = Math.round(c.p[2] - wp[2]);
+      vord.push(idxOfAdd(o.verts, o.vkey, vx, vy, vz));
+      // normal (÷1 here, stored ×−4096 at build), dedup in float space rounded
+      var nx = c.n ? c.n[0] : 0, ny = c.n ? c.n[1] : 0, nz = c.n ? c.n[2] : 0;
+      var rnx = Math.round(nx*4096)/4096, rny = Math.round(ny*4096)/4096, rnz = Math.round(nz*4096)/4096;
+      nord.push(idxOfAdd(o.norms, o.nkey, rnx, rny, rnz));
+    });
+    o.vorder.push(vord);
+    o.norder.push(nord);
+    // UVs: 4 corners in the SAME D,C,B,A order, ×255 (Mint builder domain)
+    order.forEach(function(qi){
+      var c = quad[qi];
+      o.uv.push([ clampU8(Math.round(clamp01(c.u ? c.u[0]:0)*255)),
+                  clampU8(Math.round(clamp01(c.u ? c.u[1]:0)*255)) ]);
+    });
+    o.hash.push(tri.hash & 0xFFFF);
+  });
+
+  // enforce the 255-vert byte-index ceiling (no auto-split — warn instead)
+  var overCap = [];
+  objs.forEach(function(o, i){ if (o.verts.length > 255) overCap.push(i); });
+  if (overCap.length)
+    throw new Error("bone(s) " + overCap.join(",") + " exceed 255 verts after edit — " +
+      "split that part onto its own bone in Blender, or decimate it");
+
+  // ── serialize: header (32) + 88*bones + per-object tables ──
+  var HEADER = 32, OBJHDR = 88;
+  var tableStart = HEADER + OBJHDR * boneCount;
+  // compute each object\\'s offsets in the Mint order:
+  // vertsCoord, normalCoord, vertexOrder, normalOrder, uv, texName
+  var cursor = tableStart, layout = [];
+  objs.forEach(function(o, i){
+    var L = {};
+    L.vco = cursor; cursor += o.verts.length * 8;
+    L.nco = cursor; cursor += o.norms.length * 8;
+    L.voo = cursor; cursor += o.vorder.length * 4;
+    L.noo = cursor; cursor += o.norder.length * 4;
+    L.uvo = cursor; cursor += o.vorder.length * 4 * 2;
+    L.tno = cursor; cursor += o.hash.length * 2;
+    layout.push(L);
+  });
+  var out = new Uint8Array(cursor);
+  var dv = new DataView(out.buffer);
+  // top header: copy the original first 32 bytes (bone/object counts, bbox)
+  for (var hb = 0; hb < 32; hb++) out[hb] = orig[hb];
+  // ensure bone/object count reflects boneCount (unchanged)
+  // per-object headers + tables
+  objs.forEach(function(o, i){
+    var bo = 0x20 + i * OBJHDR, L = layout[i], m = meta[i];
+    // recompute object-space bbox
+    var mn = [32767,32767,32767], mx = [-32768,-32768,-32768];
+    o.verts.forEach(function(v){ for (var c=0;c<3;c++){ if(v[c]<mn[c])mn[c]=v[c]; if(v[c]>mx[c])mx[c]=v[c]; } });
+    if (!o.verts.length){ mn=[0,0,0]; mx=[0,0,0]; }
+    dv.setUint32(bo+0x00, m.bitflags, true);
+    dv.setUint32(bo+0x04, o.hash.length, true);           // FaceCount
+    dv.setInt32(bo+0x08, mn[0], true); dv.setInt32(bo+0x0C, mn[1], true); dv.setInt32(bo+0x10, mn[2], true);
+    dv.setInt32(bo+0x14, mx[0], true); dv.setInt32(bo+0x18, mx[1], true); dv.setInt32(bo+0x1C, mx[2], true);
+    dv.setInt32(bo+0x20, m.bonePos[0], true); dv.setInt32(bo+0x24, m.bonePos[1], true); dv.setInt32(bo+0x28, m.bonePos[2], true);
+    dv.setInt32(bo+0x2C, m.parent, true);
+    dv.setUint32(bo+0x30, m.extend, true);
+    dv.setUint32(bo+0x34, o.verts.length, true);          // VertexCount
+    dv.setUint32(bo+0x38, L.vco, true);                   // VertexCoordOffset
+    dv.setUint32(bo+0x3C, L.voo, true);                   // VertexOrderOffset
+    dv.setUint32(bo+0x40, o.norms.length, true);          // NormalVertexCount
+    dv.setUint32(bo+0x44, L.nco, true);                   // NormalVertexCoordOffset
+    dv.setUint32(bo+0x48, L.noo, true);                   // NormalVertexOrderOffset
+    dv.setUint32(bo+0x4C, L.uvo, true);                   // UVOffset
+    dv.setUint32(bo+0x50, L.tno, true);                   // TextureNameOffset
+    dv.setUint32(bo+0x54, m.padding, true);
+    // vertex coords (int16 x,y,z,w=-1)
+    var p = L.vco;
+    o.verts.forEach(function(v){ dv.setInt16(p,v[0],true); dv.setInt16(p+2,v[1],true); dv.setInt16(p+4,v[2],true); dv.setInt16(p+6,-1,true); p+=8; });
+    // normal coords (×−4096, w=-1)
+    p = L.nco;
+    o.norms.forEach(function(nv){ dv.setInt16(p,clampI16(Math.round(nv[0]*-4096)),true); dv.setInt16(p+2,clampI16(Math.round(nv[1]*-4096)),true); dv.setInt16(p+4,clampI16(Math.round(nv[2]*-4096)),true); dv.setInt16(p+6,-1,true); p+=8; });
+    // vertex order (u8×4)
+    p = L.voo;
+    o.vorder.forEach(function(f){ out[p]=f[0]&0xFF; out[p+1]=f[1]&0xFF; out[p+2]=f[2]&0xFF; out[p+3]=f[3]&0xFF; p+=4; });
+    // normal order (u8×4)
+    p = L.noo;
+    o.norder.forEach(function(f){ out[p]=f[0]&0x7F; out[p+1]=f[1]&0x7F; out[p+2]=f[2]&0x7F; out[p+3]=f[3]&0x7F; p+=4; });
+    // UVs (u8×2 per corner, 4 per face)
+    p = L.uvo;
+    o.uv.forEach(function(uv){ out[p]=uv[0]; out[p+1]=uv[1]; p+=2; });
+    // texture hashes (u16 per face)
+    p = L.tno;
+    o.hash.forEach(function(h){ dv.setUint16(p, h, true); p+=2; });
+  });
+
+  var totalVerts = objs.reduce(function(a,o){ return a+o.verts.length; }, 0);
+  var totalFaces = objs.reduce(function(a,o){ return a+o.hash.length; }, 0);
+  return { bytes: out, patchedVerts: totalVerts, patchedFaces: totalFaces, reencoded: true };
+}
+
+function clamp01(x){ return x<0?0:x>1?1:x; }
+
+// Full GLB decode → flat triangle list with per-triangle bone + material hash.
+function parseGLBFull(bytes){
+  var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (dv.getUint32(0, true) !== 0x46546C67) throw new Error("not a GLB");
+  var total = dv.getUint32(8, true);
+  // walk chunks: find JSON and BIN by type, not fixed offsets (robust to real
+  // exporters that may pad or add chunks)
+  var jsonBytes = null, binChunk = null, p = 12;
+  while (p + 8 <= total && p + 8 <= bytes.length){
+    var clen = dv.getUint32(p, true), ctype = dv.getUint32(p+4, true);
+    var cstart = p + 8, cend = cstart + clen;
+    if (cend > bytes.length) break;
+    if (ctype === 0x4E4F534A) jsonBytes = bytes.subarray(cstart, cend);       // JSON
+    else if (ctype === 0x004E4942) binChunk = bytes.subarray(cstart, cend);   // BIN
+    p = cend;
+  }
+  if (!jsonBytes) throw new Error("GLB has no JSON chunk");
+  var gltf = JSON.parse(new TextDecoder().decode(jsonBytes));
+  var bin = binChunk || new Uint8Array(0);
+  var COMPSIZE = { 5120:1, 5121:1, 5122:2, 5123:2, 5125:4, 5126:4 };
+  function acc(ai){
+    var a = gltf.accessors[ai];
+    if (a.bufferView == null) throw new Error("accessor without bufferView (sparse not supported)");
+    var view = gltf.bufferViews[a.bufferView];
+    var baseOff = (view.byteOffset||0) + (a.byteOffset||0);
+    var comp = {SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT4:16}[a.type];
+    var elemSize = COMPSIZE[a.componentType] * comp;
+    var stride = view.byteStride && view.byteStride > 0 ? view.byteStride : elemSize;
+    var n = a.count * comp;
+    var arr;
+    if (a.componentType===5126) arr = new Float32Array(n);
+    else if (a.componentType===5125) arr = new Uint32Array(n);
+    else if (a.componentType===5123) arr = new Uint16Array(n);
+    else if (a.componentType===5121 || a.componentType===5120) arr = new Uint8Array(n);
+    else if (a.componentType===5122) arr = new Int16Array(n);
+    else throw new Error("accessor comp "+a.componentType);
+    var dvv = new DataView(bin.buffer, bin.byteOffset);
+    for (var e = 0; e < a.count; e++){
+      var elemOff = baseOff + e * stride;
+      for (var c = 0; c < comp; c++){
+        var o2 = elemOff + c * COMPSIZE[a.componentType];
+        if (o2 + COMPSIZE[a.componentType] > bin.length){ arr[e*comp+c] = 0; continue; }
+        if (a.componentType===5126) arr[e*comp+c] = dvv.getFloat32(o2, true);
+        else if (a.componentType===5125) arr[e*comp+c] = dvv.getUint32(o2, true);
+        else if (a.componentType===5123) arr[e*comp+c] = dvv.getUint16(o2, true);
+        else if (a.componentType===5122) arr[e*comp+c] = dvv.getInt16(o2, true);
+        else arr[e*comp+c] = dvv.getUint8(o2);
+      }
+    }
+    return arr;
+  }
+  var tris = [];
+  (gltf.meshes||[]).forEach(function(mesh){
+    mesh.primitives.forEach(function(p){
+      var hash = 0;
+      if (p.material != null && gltf.materials[p.material]){
+        var mat = gltf.materials[p.material];
+        if (mat.extras && mat.extras.kmdTexHash != null) hash = mat.extras.kmdTexHash;
+        else if (mat.name){ var mm = mat.name.split("."); var num = parseInt(mm[0],10); if(!isNaN(num)) hash = num; }
+      }
+      var pos = acc(p.attributes.POSITION);
+      var nrm = p.attributes.NORMAL != null ? acc(p.attributes.NORMAL) : null;
+      var uv  = p.attributes.TEXCOORD_0 != null ? acc(p.attributes.TEXCOORD_0) : null;
+      var jnt = p.attributes.JOINTS_0 != null ? acc(p.attributes.JOINTS_0) : null;
+      var idx = p.indices != null ? acc(p.indices) : null;
+      function vtx(vi){
+        return {
+          p: [pos[vi*3], pos[vi*3+1], pos[vi*3+2]],
+          n: nrm ? [-nrm[vi*3], -nrm[vi*3+1], -nrm[vi*3+2]] : null,   // un-negate
+          u: uv ? [uv[vi*2], uv[vi*2+1]] : null,
+          bone: jnt ? jnt[vi*4] : 0
+        };
+      }
+      if (idx){
+        var q = 0;
+        // Merge tri-pairs that form our exported quads: pattern per quad is
+        // [B,B+1,B+2, B,B+2,B+3] with 4 sequential corners. Detect and emit a
+        // quad (4 verts); otherwise emit the triangle as a degenerate quad.
+        while (q < idx.length){
+          if (q + 6 <= idx.length){
+            var a0=idx[q],a1=idx[q+1],a2=idx[q+2],a3=idx[q+3],a4=idx[q+4],a5=idx[q+5];
+            // our quad emit: (base,base+1,base+2, base,base+2,base+3)
+            if (a3===a0 && a4===a2 && a5===a0+3 && a1===a0+1 && a2===a0+2){
+              var c0=vtx(a0),c1=vtx(a1),c2=vtx(a2),c3=vtx(a5);
+              tris.push({ bone:c0.bone, hash:hash, quad:true, v:[c0,c1,c2,c3] });
+              q += 6; continue;
+            }
+          }
+          // single triangle
+          var t0=vtx(idx[q]),t1=vtx(idx[q+1]),t2=vtx(idx[q+2]);
+          tris.push({ bone:t0.bone, hash:hash, quad:false, v:[t0,t1,t2] });
+          q += 3;
+        }
+      } else {
+        var triCount = pos.length/9;
+        for (var ti=0; ti<triCount; ti++){
+          var t0b=vtx(ti*3),t1b=vtx(ti*3+1),t2b=vtx(ti*3+2);
+          tris.push({ bone:t0b.bone, hash:hash, quad:false, v:[t0b,t1b,t2b] });
+        }
+      }
+    });
+  });
+  return { triangles: tris };
+}
+
+function clampI16(x){ return x < -32768 ? -32768 : x > 32767 ? 32767 : x; }
+function clampU8(x){ return x < 0 ? 0 : x > 255 ? 255 : x; }
+
+// Minimal GLB parser: returns primitives with decoded positions/uvs + texHash.
+function parseGLB(bytes){
+  var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (dv.getUint32(0, true) !== 0x46546C67) throw new Error("not a GLB");
+  var jsonLen = dv.getUint32(12, true);
+  var jsonStr = new TextDecoder().decode(bytes.subarray(20, 20 + jsonLen));
+  var gltf = JSON.parse(jsonStr);
+  var binOff = 20 + jsonLen + 8;   // skip BIN chunk header
+  var bin = bytes.subarray(binOff);
+
+  function accessorData(ai){
+    var acc = gltf.accessors[ai];
+    var view = gltf.bufferViews[acc.bufferView];
+    var off = (view.byteOffset || 0) + (acc.byteOffset || 0);
+    var comp = { "SCALAR":1, "VEC2":2, "VEC3":3, "VEC4":4 }[acc.type];
+    var n = acc.count * comp;
+    if (acc.componentType === 5126){ var f = new Float32Array(n); var dvv = new DataView(bin.buffer, bin.byteOffset + off);
+      for (var i=0;i<n;i++) f[i]=dvv.getFloat32(i*4,true); return f; }
+    if (acc.componentType === 5123){ var u = new Uint16Array(n); var dvw = new DataView(bin.buffer, bin.byteOffset + off);
+      for (var j=0;j<n;j++) u[j]=dvw.getUint16(j*2,true); return u; }
+    throw new Error("unsupported accessor component " + acc.componentType);
+  }
+
+  var prims = [];
+  (gltf.meshes || []).forEach(function(mesh){
+    mesh.primitives.forEach(function(p){
+      var hash = 0;
+      if (p.material != null && gltf.materials[p.material] && gltf.materials[p.material].extras)
+        hash = gltf.materials[p.material].extras.kmdTexHash || 0;
+      var positions = accessorData(p.attributes.POSITION);
+      var uvs = p.attributes.TEXCOORD_0 != null ? accessorData(p.attributes.TEXCOORD_0) : null;
+      // NOTE: exporter emits quads as 2 tris (0-1-2,0-2-3); the 4 unique verts
+      // are the first 3 of tri1 + last of tri2. We reconstruct per-quad by
+      // reading the index buffer in groups of 6 → 4 unique corners.
+      var idx = accessorData(p.indices);
+      var quadPos = [], quadUv = [];
+      for (var q = 0; q + 6 <= idx.length; q += 6){
+        // buffer corners in export order [3,2,1,0]; reverse to original [0,1,2,3]
+        var bufCorners = [ idx[q], idx[q+1], idx[q+2], idx[q+5] ];
+        var corners = [ bufCorners[3], bufCorners[2], bufCorners[1], bufCorners[0] ];
+        corners.forEach(function(ci){
+          quadPos.push(positions[ci*3], positions[ci*3+1], positions[ci*3+2]);
+          if (uvs) quadUv.push(uvs[ci*2], uvs[ci*2+1]);
+        });
+      }
+      prims.push({ texHash: hash, positions: quadPos, uvs: uvs ? quadUv : null });
+    });
+  });
+  return { primitives: prims };
+}
+
+if (typeof module !== "undefined" && module.exports) module.exports = {
+  KMD_parseBlocks: KMD_parseBlocks, KMD_toGLB: KMD_toGLB, GLB_toKMD: GLB_toKMD, parseGLB: parseGLB, parseGLBFull: parseGLBFull
+};
 <\/script>
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3445,7 +5454,7 @@ if (typeof module !== "undefined") module.exports = {
 
 var SWAPUI = { platform: null, name: "",
   psx: null /* {dir, outer} */, pc: null /* {files:[{path,data}]} */,
-  stageKmds: [], donorKmds: [], refKmd: null, donorKmd: null,
+  stageKmds: [], donorKmds: [], refKmd: null, donorKmd: null, donorKmdObjs: [],
   donorTexes: [], residentTexes: [], plan: null, rebuilt: null };
 
 function SWAPUI_decodePcx(data){
@@ -3499,9 +5508,19 @@ function SWAPUI_stash(dirBytes, name){
   try{
     SWAPUI.platform = "psx"; SWAPUI.name = name;
     SWAPUI.psx = { dir: dirBytes, outer: psxParseOuter(dirBytes) };
+    SWAPUI._stageHashes = null; SWAPUI._usedHashes = null;
     var b = document.getElementById("swapBtn"); if (b) b.style.display = "";
   }catch(e){}
 }
+SWAPUI._stashPCBytes = function(mgzBytes, name){
+  // chain support for PC: re-open the swapped .mgz bytes as the new working file.
+  // JSZip.loadAsync is async, so we mark a pending reload and let the caller
+  // proceed; the loader wiring below repopulates SWAPUI.pc when done.
+  try{
+    if (typeof JSZip === "undefined"){ SWAPUI_log("PC chaining needs JSZip", "warn"); return; }
+    JSZip.loadAsync(mgzBytes).then(function(zip){ SWAPUI_stashPC(zip, name); SWAPUI_loadResident(); });
+  }catch(e){ SWAPUI_log("PC chain reload failed: " + e.message, "warn"); }
+};
 function SWAPUI_stashPC(zipObj, name){
   var files = [], jobs = [];
   zipObj.forEach(function(path, z){
@@ -3511,17 +5530,45 @@ function SWAPUI_stashPC(zipObj, name){
   });
   Promise.all(jobs).then(function(){
     SWAPUI.platform = "pc"; SWAPUI.name = name;
+    SWAPUI._pcSeg = null;
     SWAPUI.pc = { files: files };
     var b = document.getElementById("swapBtn"); if (b) b.style.display = "";
   });
 }
 
 // ── platform-neutral stage access ───────────────────────────────────────────
+function SWAPUI_pcSeg(){
+  // Stage folders are normally at path segment 0, but a real PC stage.mgz nests
+  // everything under a single top-level "stage/" wrapper (paths like
+  // "stage/init_jim/res_mdl1.dar"). Detect that wrapper once and return the
+  // segment index the stage NAME actually lives at (0 = flat, 1 = wrapped).
+  if (SWAPUI._pcSeg != null) return SWAPUI._pcSeg;
+  var tops = {}, nTop = 0;
+  SWAPUI.pc.files.forEach(function(f){
+    var parts = f.path.split("/");
+    if (parts.length >= 2 && !tops[parts[0]]){ tops[parts[0]] = 1; nTop++; }
+  });
+  var seg = 0;
+  if (nTop === 1){
+    var secs = {}, nSec = 0;
+    SWAPUI.pc.files.forEach(function(f){
+      var parts = f.path.split("/");
+      if (parts.length >= 3 && !secs[parts[1]]){ secs[parts[1]] = 1; nSec++; }
+    });
+    if (nSec > 1) seg = 1;               // single wrapper with many real stages beneath it
+  }
+  SWAPUI._pcSeg = seg;
+  return seg;
+}
+function SWAPUI_pcStageOf(path){
+  var parts = path.split("/"); var s = SWAPUI_pcSeg();
+  return parts.length > s ? parts[s] : parts[0];
+}
 function SWAPUI_stageNames(){
   if (SWAPUI.platform === "psx") return SWAPUI.psx.outer.stages.map(function(s){ return s.name; });
   var seen = {}, out = [];
   SWAPUI.pc.files.forEach(function(f){
-    var top = f.path.split("/")[0];
+    var top = SWAPUI_pcStageOf(f.path);
     if (!seen[top]){ seen[top] = 1; out.push(top); }
   });
   return out;
@@ -3535,7 +5582,7 @@ function SWAPUI_ctx(idx){
   }
   var name = names[idx];
   return { name: name,
-    files: SWAPUI.pc.files.filter(function(f){ return f.path.split("/")[0] === name; }) };
+    files: SWAPUI.pc.files.filter(function(f){ return SWAPUI_pcStageOf(f.path) === name; }) };
 }
 function SWAPUI_collect(ctx){
   return SWAPUI.platform === "psx" ? SWAP_collectTextures(ctx.parsed.entries) : SWAP_pcCollect(ctx.files);
@@ -3598,13 +5645,17 @@ function SWAPUI_checkedHashes(elId){
 // button gating with explanatory tooltips
 function SWAPUI_gate(state){
   var go = document.getElementById("swGo"), dlB = document.getElementById("swDl");
+  var chB = document.getElementById("swChain");
   if (!go || !dlB) return;
   if (state === "start"){ go.disabled = true; dlB.disabled = true;
+    if (chB){ chB.disabled = true; chB.title = "run \\u2714 Verify & swap first, then chain the next swap on top"; }
     go.title = "build the plan first"; dlB.title = "run Verify & swap first"; }
   else if (state === "planned"){ go.disabled = false; dlB.disabled = true;
+    if (chB){ chB.disabled = true; }
     go.title = "run the swap with full verification"; dlB.title = "run Verify & swap first"; }
   else if (state === "done"){ go.disabled = true; dlB.disabled = false;
-    go.title = "already swapped \\u2014 change selections and rebuild the plan to swap again"; dlB.title = ""; }
+    if (chB){ chB.disabled = false; chB.title = "keep this swap and stack the next one on top \\u2014 no reload needed"; }
+    go.title = "already swapped \\u2014 use \\u2795 Swap another to stack the next, or Download"; dlB.title = ""; }
 }
 function SWAPUI_fail(context, msgs){
   msgs.forEach(function(m){ SWAPUI_log("\\u2716 " + m, "err"); });
@@ -3617,7 +5668,12 @@ function SWAPUI_open(){
   if (!SWAPUI.platform){ alert("Load a STAGE.DIR or stage.mgz first (drop it on the tool)."); return; }
   if (document.getElementById("swapPanel")) return;
   var names = SWAPUI_stageNames();
-  var defIdx = 0; names.forEach(function(n, i){ if (/^init/i.test(n)) defIdx = i; });
+  var defIdx = 0, exactInit = -1;
+  names.forEach(function(n, i){
+    if (/^init$/i.test(n)) exactInit = i;
+    else if (exactInit < 0 && /^init/i.test(n)) defIdx = i;
+  });
+  if (exactInit >= 0) defIdx = exactInit;
   var donIdx = -1;
   names.forEach(function(n, i){ if (donIdx < 0 && i !== defIdx) donIdx = i; });
   if (donIdx < 0) donIdx = defIdx;
@@ -3644,11 +5700,11 @@ function SWAPUI_open(){
 
     box("Step 1 \\u2014 resident area \\u00B7 what comes OUT", "#e88",
       'Resident stage: <select id="swStage" ' + sel + '></select> &nbsp; ' +
-      'Reference KMD: <select id="swRefKmd" ' + sel + '></select> ' +
+      'Reference KMD(s): <select id="swRefKmd" multiple size="5" ' + sel + '></select> ' +
       'or upload <input type="file" id="swRefKmdFile" accept=".kmd" style="font-size:11px"> ' +
       '<span id="swRefInfo" style="color:#9ab;font-size:11px"></span>' +
       '<div id="swResGrid" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;max-height:300px;overflow:auto;background:#0a0e14;border:1px solid #234;border-radius:6px;padding:8px"></div>' +
-      '<div style="color:#789;font-size:10px;margin-top:4px">picking a KMD auto-checks the textures it references; adjust checkboxes freely \\u2014 checked = removed</div>') +
+      '<div style="color:#789;font-size:10px;margin-top:4px">click to toggle MULTIPLE KMDs on/off (e.g. Snake + goggles + attachments) \\u2014 textures auto-check as the UNION of all their references. The <b>first selected</b> KMD is the model-swap target. Adjust checkboxes freely \\u2014 checked = removed</div>') +
 
     box("Step 2 \\u2014 donor stage \\u00B7 what goes IN", "#8d8",
       'Donor stage: <select id="swDonor" ' + sel + '></select> &nbsp; ' +
@@ -3657,13 +5713,28 @@ function SWAPUI_open(){
       '<span id="swDonorInfo" style="color:#9ab;font-size:11px"></span>' +
       '<div id="swDonGrid" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;max-height:300px;overflow:auto;background:#0a0e14;border:1px solid #234;border-radius:6px;padding:8px"></div>' +
       '<div style="color:#789;font-size:10px;margin-top:4px">picking a KMD auto-checks the textures it references; checked = pulled into the resident area (names/hashes kept)</div>' +
-      '<label style="color:#9fd;font-size:11px;display:block;margin-top:6px"><input type="checkbox" id="swKmdSwap" checked> also swap the MODEL: the donor KMD replaces the resident KMD in place, renamed to the resident\\u2019s hash/name</label>') +
+      '<label style="color:#9fd;font-size:11px;display:block;margin-top:6px"><input type="checkbox" id="swKmdSwap" checked> also swap the MODEL: the donor KMD replaces the resident KMD in place, renamed to the resident\\u2019s hash/name</label>\\n      <label style="color:#c9f;font-size:11px;display:block;margin-top:4px"><input type="checkbox" id="swPcAltModels" checked> (PC) also replace stage ALT models \\u2014 sne_wet1-5 / sne_nude / sne_bld1-2 cutscene copies get the donor KMD (covers all 9 stages incl. opening)</label>' +
+      '<label style="color:#fc9;font-size:11px;display:block;margin-top:4px"><input type="checkbox" id="swAutoCatalog" checked> (PSX) automatically run the built-in catalog after the swap \\u2014 puts the character into every cutscene stage (d00a, d18a, opening, s00a, s03b/c/e, s10a, s18a)</label>') +
 
     box("Step 3 \\u2014 plan \\u00B7 verify \\u00B7 swap", "#8cf",
       btn("swPlan", "\\uD83D\\uDCCB Build plan", "#1d2a3a", "#9df", "#27a") + ' ' +
       btn("swGo", "\\u2714 Verify &amp; swap", "#1d3a26", "#9fd", "#2a7") + ' ' +
-      btn("swDl", "\\u2B07 Download " + (SWAPUI.platform === "psx" ? "STAGE.DIR" : "stage.mgz"), "#2a2a3a", "#adf", "#66a") +
-      '<div id="swPlanTbl" style="margin-top:8px"></div>') +
+      btn("swChain", "\\u2795 Swap another (keep going)", "#2a1d3a", "#d9f", "#84a") + ' ' +
+      btn("swDl", "\\u2B07 Download " + (SWAPUI.platform === "psx" ? "STAGE.DIR" : "stage.mgz"), "#2a2a3a", "#adf", "#66a") + ' ' +
+      btn("swUndo", "\\u21B6 Undo swap", "#3a2a2a", "#fbb", "#a66") +
+      '<div id="swPlanTbl" style="margin-top:8px"></div>' +
+      '<canvas id="swVramViz" width="768" height="552" style="display:none;margin-top:8px;border:1px solid #234;border-radius:6px;background:#0a0e14;max-width:100%"></canvas>') +
+
+    box("KMD \\u2192 GLB \\u00B7 export models, edit in Blender, re-import", "#8fc",
+      'Stage: <select id="glbStage" ' + sel + '></select> ' +
+      btn("glbList", "\\uD83D\\uDCC2 list KMDs", "#1d3a3a", "#9fd", "#2aa") +
+      '<div id="glbKmdList" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px"></div>' +
+      '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #234">' +
+      '<b style="color:#9fd;font-size:12px">Re-import an edited GLB \\u2192 KMD:</b> ' +
+      'pick the ORIGINAL KMD it came from, then drop the .glb' +
+      '<div id="glbDrop" style="margin-top:6px;border:2px dashed #2aa;border-radius:6px;padding:16px;text-align:center;color:#8cc;font-size:12px;background:#0a1414">drop an edited <b>.glb</b> here to rebuild its KMD</div>' +
+      '<div id="glbImportInfo" style="color:#9ab;font-size:11px;margin-top:6px"></div></div>' +
+      '<div style="color:#789;font-size:10px;margin-top:6px">Export bakes each KMD\\u2019s geometry + UVs + textures (from the sibling texture DAR) into a standalone .glb you can open in Blender/any glTF tool. Topology is preserved on re-import: edit vertex positions and UVs freely, but keep the face/vertex COUNT the same (don\\u2019t add/delete geometry) so it writes back cleanly.</div>') +
 
     '<div id="swLog" style="background:#060a10;border:1px solid #234;border-radius:6px;padding:8px;font:11px/1.5 ui-monospace,monospace;max-height:240px;overflow:auto;white-space:pre-wrap"></div>' +
     '</div>';
@@ -3679,26 +5750,52 @@ function SWAPUI_open(){
   SWAPUI_gate("start");
 
   var stSel = document.getElementById("swStage"), dnSel = document.getElementById("swDonor");
+  var glbSel = document.getElementById("glbStage");
   names.forEach(function(n, i){
     var o1 = document.createElement("option"); o1.value = i; o1.textContent = n;
     if (i === defIdx) o1.selected = true; stSel.appendChild(o1);
     var o2 = document.createElement("option"); o2.value = i; o2.textContent = n;
     if (i === donIdx) o2.selected = true; dnSel.appendChild(o2);
+    if (glbSel){ var o3 = document.createElement("option"); o3.value = i; o3.textContent = n;
+      if (i === defIdx) o3.selected = true; glbSel.appendChild(o3); }
   });
+  if (SWAPUI.platform === "psx"){
+    document.getElementById("glbList").onclick = SWAPUI_glbListKmds;
+    SWAPUI_glbSetupDrop();
+  } else {
+    var gp = document.getElementById("glbList"); if (gp) gp.closest("div[style]") &&
+      (document.getElementById("glbStage").disabled = true);
+  }
 
   document.getElementById("swClose").onclick = function(){ ov.remove(); };
   stSel.onchange = SWAPUI_loadResident;
   dnSel.onchange = SWAPUI_loadDonor;
-  document.getElementById("swRefKmd").onchange = function(){
-    var i = +this.value;
-    SWAPUI.refKmdObj = i >= 0 && SWAPUI.stageKmds[i] ? SWAPUI.stageKmds[i] : null;
+  var refKmdSel = document.getElementById("swRefKmd");
+  function refKmdSync(){
+    var idxs = Array.prototype.slice.call(refKmdSel.selectedOptions || [])
+      .map(function(o){ return +o.value; }).filter(function(i){ return i >= 0; });
+    SWAPUI.refKmdObjs = idxs.map(function(i){ return SWAPUI.stageKmds[i]; }).filter(Boolean);
+    SWAPUI.refKmdObj = SWAPUI.refKmdObjs[0] || null;   /* first selected = model-swap target */
     SWAPUI.refKmd = SWAPUI.refKmdObj ? SWAPUI.refKmdObj.bytes : null;
     SWAPUI_applyRefKmd();
-  };
+  }
+  refKmdSel.onchange = refKmdSync;
+  // Plain click toggles an option on/off (no ctrl/cmd needed). We intercept
+  // mousedown on the <option>, flip its selected state, and prevent the
+  // browser's default single-select-replace behavior.
+  refKmdSel.addEventListener("mousedown", function(e){
+    var opt = e.target;
+    if (opt && opt.tagName === "OPTION"){
+      e.preventDefault();
+      opt.selected = !opt.selected;
+      refKmdSel.focus();
+      refKmdSync();
+    }
+  });
   document.getElementById("swRefKmdFile").onchange = function(){
     var f = this.files[0]; if (!f) return;
     f.arrayBuffer().then(function(ab){
-      SWAPUI.refKmd = new Uint8Array(ab); SWAPUI.refKmdObj = null;
+      SWAPUI.refKmd = new Uint8Array(ab); SWAPUI.refKmdObj = null; SWAPUI.refKmdObjs = null;
       SWAPUI_log("reference KMD uploaded: " + f.name + " (model swap needs an in-stage KMD)", "warn");
       SWAPUI_applyRefKmd();
     });
@@ -3720,6 +5817,52 @@ function SWAPUI_open(){
   document.getElementById("swPlan").onclick = SWAPUI_buildPlan;
   document.getElementById("swGo").onclick = SWAPUI_execute;
   document.getElementById("swDl").onclick = function(){ SWAPUI_download(); };
+  document.getElementById("swUndo").onclick = function(){ SWAPUI_undo(); };
+  var chainBtn = document.getElementById("swChain");
+  if (chainBtn){
+    chainBtn.disabled = true;   // enabled after a successful swap
+    chainBtn.title = "run \\u2714 Verify & swap first, then chain the next swap on top";
+    chainBtn.onclick = function(){
+      if (!SWAPUI.rebuilt){ SWAPUI_log("nothing swapped yet \\u2014 run \\u2714 Verify & swap first", "err"); return; }
+      // Re-load the tool's working state FROM the swapped bytes, so the next swap
+      // stacks on top without re-picking the file. Character + gun etc. accumulate.
+      if (SWAPUI.platform === "psx"){
+        SWAPUI_stash(SWAPUI.rebuilt, SWAPUI.name);
+      } else {
+        if (SWAPUI._stashPCBytes){ SWAPUI._stashPCBytes(SWAPUI.rebuilt, SWAPUI.name); }
+        else { SWAPUI_log("PC chaining unavailable in this build \\u2014 download and reload", "warn"); return; }
+      }
+      // reset per-swap UI state for a fresh pick, keep the loaded (now-swapped) DIR
+      SWAPUI.plan = null; SWAPUI.rebuilt = null;
+      SWAPUI.refKmdObj = null; SWAPUI.refKmdObjs = null; SWAPUI.donorKmdObj = null; SWAPUI.donorKmd = null;
+      SWAPUI._afterEntries = null;
+      document.getElementById("swLog").innerHTML = "";
+      var go = document.getElementById("swGo"), dl = document.getElementById("swDl");
+      if (go) go.disabled = true;
+      chainBtn.disabled = true;
+      SWAPUI_loadResident();
+      SWAPUI_log("\\u2795 ready for the next swap \\u2014 the character you just swapped is baked in. Pick the next KMD (e.g. the gun) in Step 1/2, then Build plan \\u2192 Verify & swap. Download when you\\u2019re done.", "ok");
+    };
+  }
+  var catRun = document.getElementById("swCatRun");
+  var catFile = document.getElementById("swCatFile");
+  if (catRun){
+    if (SWAPUI.platform !== "psx"){
+      catRun.disabled = true;
+      catRun.title = "catalog batch is PSX STAGE.DIR only";
+    } else {
+      catRun.disabled = true;                       // enabled once a catalog is loaded
+      catRun.title = "load a catalog .json first";
+    }
+    catRun.onclick = function(){ SWAPUI_runCatalog(); };
+  }
+  if (catFile){ catFile.onchange = function(){ SWAPUI_loadCatalog(catFile.files[0]); }; }
+  if (SWAPUI.platform === "psx"){
+    try{ SWAPUI_applyCatalog(SWAPUI_DEFAULT_CATALOG, "built-in"); }
+    catch(e){ SWAPUI_log("built-in catalog failed: " + e.message, "warn"); }
+  }
+  document.getElementById("swUndo").disabled = true;
+  document.getElementById("swUndo").title = "revert to the state before the last swap";
   // disabled buttons swallow clicks silently — explain via the container
   document.getElementById("swapPanel").addEventListener("click", function(e){
     var t = e.target;
@@ -3736,35 +5879,40 @@ function SWAPUI_loadResident(){
   var ctx = SWAPUI_ctx(+document.getElementById("swStage").value);
   SWAPUI.residentTexes = SWAPUI_collect(ctx);
   SWAPUI.stageKmds = SWAPUI_kmds(ctx);
-  SWAPUI.refKmd = null; SWAPUI.plan = null; SWAPUI.rebuilt = null;
+  SWAPUI.refKmd = null; SWAPUI.refKmdObjs = null; SWAPUI.plan = null; SWAPUI.rebuilt = null;
   SWAPUI_gate("start");
   document.getElementById("swPlanTbl").innerHTML = "";
   document.getElementById("swRefInfo").textContent = "";
   var rsel = document.getElementById("swRefKmd");
-  rsel.innerHTML = '<option value="-1">\\u2014 ' + SWAPUI.stageKmds.length + ' KMD(s) here \\u2014</option>';
+  rsel.innerHTML = "";
   SWAPUI.stageKmds.forEach(function(k, ki){
     var o = document.createElement("option"); o.value = ki; o.textContent = k.label; rsel.appendChild(o);
   });
+  document.getElementById("swRefInfo").textContent =
+    SWAPUI.stageKmds.length + " KMD(s) \\u2014 ctrl/cmd-click for multiple";
   SWAPUI_grid("swResGrid", SWAPUI.residentTexes, { checkable: true });
   SWAPUI_log("resident \\u201C" + ctx.name + "\\u201D: " + SWAPUI.residentTexes.length +
     " textures, " + SWAPUI.stageKmds.length + " KMD(s)");
   }catch(e){ SWAPUI_fail("Resident scan", [e.message]); }
 }
 function SWAPUI_applyRefKmd(){
-  if (!SWAPUI.refKmd) return;
-  var refs = SWAP_kmdHashes(SWAPUI.refKmd), want = {};
-  refs.forEach(function(h){ want[h] = 1; });
-  /* ACCUMULATE: keep everything already checked (e.g. from a prior KMD pick
-     — equip variants, alternate heads) and add this model's refs on top */
-  var checked = SWAPUI_checkedHashes("swResGrid"), mark = {};
-  checked.forEach(function(h){ mark[h] = "remove"; });
+  var sources = (SWAPUI.refKmdObjs && SWAPUI.refKmdObjs.length)
+    ? SWAPUI.refKmdObjs.map(function(k){ return k.bytes; })
+    : (SWAPUI.refKmd ? [SWAPUI.refKmd] : []);
+  if (!sources.length) return;
+  var want = {}, uniq = [];
+  sources.forEach(function(b){
+    SWAP_kmdHashes(b).forEach(function(h){ if (!want[h]){ want[h] = 1; uniq.push(h); } });
+  });
+  var checked = new Set(), mark = {};
   SWAPUI.residentTexes.forEach(function(t){ if (want[t.hash]){ checked.add(t.hash); mark[t.hash] = "remove"; } });
   SWAPUI_grid("swResGrid", SWAPUI.residentTexes, { checkable: true, checked: checked, mark: mark });
-  var missing = refs.filter(function(h){ return !checked.has(h); });
+  var missing = uniq.filter(function(h){ return !checked.has(h); });
   document.getElementById("swRefInfo").textContent =
-    "\\u2192 " + checked.size + "/" + refs.length + " refs found here" +
+    "\\u2192 " + sources.length + " KMD(s) \\u00B7 " + checked.size + "/" + uniq.length + " refs found here" +
     (missing.length ? " (" + missing.length + " load from stage packs)" : "");
-  SWAPUI_log("reference model: auto-checked " + checked.size + " resident texture(s) for removal", "ok");
+  SWAPUI_log("reference model(s): auto-checked " + checked.size + " resident texture(s) for removal (union of " +
+    sources.length + " KMD" + (sources.length > 1 ? "s" : "") + ")", "ok");
 }
 
 // ── step 2: donor load + KMD marking ────────────────────────────────────────
@@ -3790,9 +5938,7 @@ function SWAPUI_applyDonorKmd(){
   if (!SWAPUI.donorKmd) return;
   var refs = SWAP_kmdHashes(SWAPUI.donorKmd), want = {};
   refs.forEach(function(h){ want[h] = 1; });
-  /* ACCUMULATE across picks — multi-part characters pull from several KMDs */
-  var checked = SWAPUI_checkedHashes("swDonGrid"), mark = {};
-  checked.forEach(function(h){ mark[h] = "take"; });
+  var checked = new Set(), mark = {};
   SWAPUI.donorTexes.forEach(function(t){ if (want[t.hash]){ checked.add(t.hash); mark[t.hash] = "take"; } });
   SWAPUI_grid("swDonGrid", SWAPUI.donorTexes, { checkable: true, checked: checked, mark: mark });
   var missing = refs.filter(function(h){ return !checked.has(h); });
@@ -3817,6 +5963,7 @@ function SWAPUI_adds(){
 function SWAPUI_buildPlan(){
   document.getElementById("swLog").innerHTML = "";
   SWAPUI.plan = null; SWAPUI.rebuilt = null;
+  SWAPUI._pendingPcDistribution = null;
   SWAPUI_gate("start");
   var removeSet = SWAPUI_checkedHashes("swResGrid");
   var adds = SWAPUI_adds();
@@ -3835,11 +5982,77 @@ function SWAPUI_buildPlan(){
       kmdSwapNote = "donor model \\u2192 replaces " + rk.name + " (renamed)";
     }
   }
+  var palPatchEl = document.getElementById("swPalPatch");
+  var swapOpts = { paletteRelocated: !!(palPatchEl && palPatchEl.checked) };
+
+  // ── STAGE-DUPLICATE ANTI-COLLISION (PSX) ──
+  // Vanilla stage packs carry copies of character textures for cutscene
+  // appearances (Liquid's live inside s01a, d18a, s18a...). The engine
+  // resolves textures BY HASH, so an added texture whose hash also exists
+  // in a stage pack renders with the STAGE's copy in that stage (the
+  // green-pants / blue-neck stage-dependent bug). Rehash colliding adds to
+  // unique ids and patch the donor KMD's reference table so the player's
+  // textures are unique game-wide. Vanilla cutscene characters keep their
+  // own copies untouched.
+  if (SWAPUI.platform === "psx" && adds.length){
+    if (!SWAPUI._stageHashes){
+      var sh = new Set(), uh = new Set();
+      SWAPUI.psx.outer.stages.forEach(function(st){
+        var texs = SWAP_collectTextures(psxParseStage(
+          SWAPUI.psx.dir.subarray(st.byteOff, st.byteOff + st.extent)).entries);
+        texs.forEach(function(tx){ uh.add(tx.hash); if (st.name !== ctx.info.name) sh.add(tx.hash); });
+      });
+      SWAPUI._stageHashes = sh; SWAPUI._usedHashes = uh;
+    }
+    var kmdList = [];
+    if (kmdSwap && kmdSwap.donorBytes) kmdList.push(kmdSwap.donorBytes);
+    if (SWAPUI.refKmdObjs) SWAPUI.refKmdObjs.forEach(function(k){ if (k.bytes) kmdList.push(k.bytes); });
+    var dd = SWAP_dedupeAddHashes(adds, kmdList, SWAPUI._stageHashes, SWAPUI._usedHashes);
+    if (dd.renamed.length){
+      SWAPUI_log("\\u26A0 " + dd.renamed.length + " added texture(s) share hashes with STAGE packs " +
+        "(vanilla characters appear in stages) — rehashed to unique ids, " + dd.refsPatched +
+        " KMD reference(s) patched:", "warn");
+      dd.renamed.forEach(function(r){
+        SWAPUI_log("    0x" + r.from.toString(16) + " \\u2192 0x" + r.to.toString(16), "warn");
+      });
+    }
+  }
+
+  // ── STAGE-DUPLICATE ANTI-COLLISION (PC) ──
+  // Same bug, PC container: stage packs ship cutscene copies of the character's
+  // textures and the engine resolves by hash, so those stages re-register the
+  // hash and the player renders the stage's art. Rename colliding adds to fresh
+  // unused names and patch the donor KMD refs.
+  if (SWAPUI.platform === "pc" && adds.length){
+    if (!SWAPUI._pcStageHashes){
+      var sets = SWAP_pcStageHashSets(SWAPUI.pc.files, ctx.name, SWAPUI_pcStageOf);
+      SWAPUI._pcStageHashes = sets.stageHashes; SWAPUI._pcUsedHashes = sets.usedHashes;
+    }
+    var kmdListPc = [];
+    if (kmdSwap && kmdSwap.donorBytes) kmdListPc.push(kmdSwap.donorBytes);
+    if (SWAPUI.refKmdObjs) SWAPUI.refKmdObjs.forEach(function(k){ if (k.bytes) kmdListPc.push(k.bytes); });
+    var ddp = SWAP_pcDedupeAddNames(adds, kmdListPc, SWAPUI._pcStageHashes, SWAPUI._pcUsedHashes);
+    if (ddp.renamed.length){
+      SWAPUI_log("\\u26A0 " + ddp.renamed.length + " added texture(s) share hashes with STAGE packs " +
+        "(cutscene copies) \\u2014 renamed to unique names, " + ddp.refsPatched + " KMD ref(s) patched.", "warn");
+    }
+  }
+
   var plan = SWAPUI.platform === "psx"
-    ? SWAP_plan(ctx.parsed.entries, removeSet, adds, kmdSwap)
+    ? SWAP_plan(ctx.parsed.entries, removeSet, adds, kmdSwap, swapOpts)
     : SWAP_pcPlan(ctx.files, removeSet, adds, kmdSwap);
   plan.warnings.forEach(function(w){ SWAPUI_log("\\u26A0 " + w, "warn"); });
-  if (!plan.ok){ SWAPUI_fail("Plan", plan.errors); return; }
+  if (!plan.ok){
+    if (plan.overflow && SWAPUI.platform === "psx"){
+      SWAPUI_overflowDialog(ctx, removeSet, adds, kmdSwap, swapOpts, plan);
+      return;
+    }
+    if (plan.overflow && SWAPUI.platform === "pc"){
+      SWAPUI_pcOverflowDialog(ctx, removeSet, adds, kmdSwap);
+      return;
+    }
+    SWAPUI_fail("Plan", plan.errors); return;
+  }
   plan.errors.forEach(function(e){ SWAPUI_log("\\u2716 " + e, "err"); });
   plan._removeSet = removeSet; plan._adds = adds; plan._ctx = ctx;
   plan._kmdSwap = kmdSwap; plan._kmdSwapNote = kmdSwapNote;
@@ -3865,43 +6078,318 @@ function SWAPUI_buildPlan(){
     "<table><tr><th></th><th>texture</th><th>size</th><th>placement</th><th>space</th></tr>" + rows + "</table>";
   SWAPUI_log("\\u2713 plan ready: " + removeSet.size + " out, " + plan.mapping.length + " in (" +
     plan.stats.container + "). Review the table, then Verify & swap.", "ok");
+  if (SWAPUI.platform === "psx") SWAPUI_drawVramViz(removeSet, plan, swapOpts);
   SWAPUI_gate("planned");
+}
+
+// Deep snapshot of the current loaded stage (before any swap) so Undo can
+// restore it byte-for-byte. Taken lazily right before the first swap applies.
+function SWAPUI_snapshot(){
+  if (SWAPUI._undoSnap) return;                 /* only the pre-first-swap state */
+  if (SWAPUI.platform === "psx"){
+    SWAPUI._undoSnap = {
+      platform: "psx",
+      dir: SWAPUI.psx.dir.slice(),               /* full stage.dir bytes */
+      residentTexes: SWAPUI.residentTexes
+    };
+  } else {
+    SWAPUI._undoSnap = {
+      platform: "pc",
+      files: SWAPUI.pc.files.map(function(f){ return { path: f.path, data: f.data.slice() }; }),
+      residentTexes: SWAPUI.residentTexes
+    };
+  }
+}
+
+function SWAPUI_undo(){
+  var s = SWAPUI._undoSnap;
+  if (!s){ alert("Nothing to undo \\u2014 no swap has been applied yet."); return; }
+  if (s.platform === "psx"){
+    SWAPUI.psx.dir = s.dir.slice();
+    SWAPUI.psx.outer = psxParseOuter(SWAPUI.psx.dir);
+  } else {
+    SWAPUI.pc.files = s.files.map(function(f){ return { path: f.path, data: f.data.slice() }; });
+  }
+  SWAPUI.rebuilt = null; SWAPUI.plan = null; SWAPUI._afterEntries = null;
+  SWAPUI._undoSnap = null;
+  SWAPUI_gate("start");
+  document.getElementById("swUndo").disabled = true;
+  document.getElementById("swPlanTbl").innerHTML = "";
+  // reload the resident view from the restored bytes
+  SWAPUI_loadResident();
+  SWAPUI_loadDonor();
+  SWAPUI_log("\\u21B6 UNDONE \\u2014 stage restored to the state before the last swap.", "ok");
+}
+
+// ── catalog batch: one donor across every listed stage in the STAGE.DIR ──────
+// Load a catalog file: parse, stash, and render a tick list of its stages.
+// All ticked by default; a stage named in the catalog's optional "disabled"
+// array starts unticked. Nothing runs until the user clicks Run selected.
+// Built-in resident-swap catalog (donor 39213 = Snake). Auto-loaded on PSX;
+// uploading a catalog JSON overrides it.
+var SWAPUI_DEFAULT_CATALOG = {"_comment":"Every listed stage character is REPLACED WITH the donor (39213 = Snake) via kmd-replace, keeping the member hash. In the tool, load this file then tick/untick stages in the 'Run selected' list. Names in 'disabled' start UNTICKED. Per-entry 'method' or 'donor' overrides the defaults.","resident":"init.stg","donor":39213,"disabled":[],"stages":{"d00a":[{"hash":30358,"index":5},{"hash":30356,"index":6},{"hash":30354,"index":7},{"hash":30355,"index":8},{"hash":30357,"index":9}],"d18a":[{"hash":4233,"index":9},{"hash":13506,"index":10}],"opening":[{"hash":30358,"index":9}],"s00a":[{"hash":30355,"index":6}],"s03b":[{"hash":13506,"index":10}],"s03c":[{"hash":13506,"index":8}],"s03e":[{"hash":13506,"index":6}],"s10a":[{"hash":4232,"index":10}],"s18a":[{"hash":4233,"index":10},{"hash":13506,"index":11}]}};
+
+function SWAPUI_loadCatalog(file){
+  if (SWAPUI.platform !== "psx"){
+    SWAPUI_log("catalog batch is PSX STAGE.DIR only (loaded: " +
+      (SWAPUI.platform ? SWAPUI.platform.toUpperCase() : "nothing") + ")", "err");
+    return;
+  }
+  if (!file){ return; }
+  file.arrayBuffer().then(function(ab){
+    var cat;
+    try{ cat = JSON.parse(new TextDecoder().decode(new Uint8Array(ab))); }
+    catch(e){ SWAPUI_fail("Catalog parse", [e.message]); return; }
+    SWAPUI_applyCatalog(cat, "from " + file.name);
+  });
+}
+
+function SWAPUI_applyCatalog(cat, label){
+    if (!cat.stages || typeof cat.stages !== "object"){
+      SWAPUI_log('catalog has no "stages" map', "err"); return;
+    }
+    SWAPUI.catalog = cat;
+    function strip(n){ return String(n).replace(/\\.stg$/i, ""); }
+    var disabled = {}; (cat.disabled || []).forEach(function(n){ disabled[strip(n)] = true; });
+    var names = Object.keys(cat.stages);
+    var rows = names.map(function(rawName){
+      var name = strip(rawName), n = (cat.stages[rawName] || []).length;
+      return '<label style="display:inline-flex;align-items:center;gap:6px;margin:2px 16px 2px 0;font-size:12px">' +
+             '<input type="checkbox" class="swCatChk" data-stage="' + name + '"' +
+             (disabled[name] ? "" : " checked") + '> ' +
+             name + ' <span style="color:#789">(' + n + ')</span></label>';
+    }).join("");
+    var header = '<div style="margin-bottom:6px">' +
+      '<b style="color:#fd9">' + names.length + ' stage(s)</b> \\u00B7 tick the ones to swap \\u00B7 ' +
+      '<a href="#" id="swCatAll" style="color:#8cf">all</a> / ' +
+      '<a href="#" id="swCatNone" style="color:#8cf">none</a></div>';
+    document.getElementById("swCatList").innerHTML = header + rows;
+    document.getElementById("swCatAll").onclick  = function(e){ e.preventDefault(); SWAPUI_catSetAll(true);  };
+    document.getElementById("swCatNone").onclick = function(e){ e.preventDefault(); SWAPUI_catSetAll(false); };
+    document.getElementById("swCatSummary").innerHTML = "";
+    var run = document.getElementById("swCatRun");
+    if (run){ run.disabled = false; run.title = ""; }
+    SWAPUI_log("Catalog " + (label || "loaded") + ": " + names.length +
+      " stage(s), all ticked by default. Untick any to skip, then Run selected.", "ok");
+}
+
+function SWAPUI_catSetAll(v){
+  var chks = document.querySelectorAll(".swCatChk");
+  for (var i = 0; i < chks.length; i++) chks[i].checked = v;
+}
+
+// Run only the ticked stages.
+function SWAPUI_runCatalog(){
+  if (SWAPUI.platform !== "psx"){ SWAPUI_log("catalog batch is PSX STAGE.DIR only", "err"); return; }
+  var cat = SWAPUI.catalog;
+  if (!cat){ SWAPUI_log("load a catalog .json first", "err"); return; }
+  var chks = document.querySelectorAll(".swCatChk"), selected = [];
+  for (var i = 0; i < chks.length; i++) if (chks[i].checked) selected.push(chks[i].getAttribute("data-stage"));
+  if (!selected.length){ SWAPUI_log("no stages ticked \\u2014 nothing to swap", "err"); return; }
+
+  document.getElementById("swLog").innerHTML = "";
+  document.getElementById("swCatSummary").innerHTML = "";
+  SWAPUI_snapshot();                         /* capture pre-batch state for Undo */
+
+  var out;
+  try{ out = SWAP_runCatalogPsx(SWAPUI.psx.dir, cat, { selected: selected }); }
+  catch(e){ SWAPUI_fail("Catalog run", [e.message]); return; }
+  if (!out.ok){ SWAPUI_fail("Catalog run", [out.error]); return; }
+
+  var okCount = 0, errCount = 0, missCount = 0, skipCount = 0, rows = "";
+  out.summary.forEach(function(s){
+    if (s.status === "skipped"){
+      skipCount++;
+      rows += "<tr><td>" + s.stage + "</td><td style='color:#789'>skipped</td><td>not ticked</td></tr>";
+      return;
+    }
+    if (s.status === "missing"){
+      missCount++;
+      rows += "<tr><td>" + s.stage + "</td><td style='color:#fd7'>MISSING</td>" +
+        "<td>not present in this STAGE.DIR \\u2014 skipped</td></tr>";
+      return;
+    }
+    s.results.forEach(function(r){
+      var good = (r.status === "kmd-replace" || r.status === "patch-char");
+      if (good) okCount++; else errCount++;
+      var detail = r.status === "kmd-replace"
+        ? ("member #" + r.ei + " \\u2190 donor 0x" + r.donor.toString(16) +
+           " \\u00B7 " + r.oldLen + "\\u2192" + r.newLen + " B")
+        : r.status === "patch-char"
+        ? ("deleted #" + r.ei + " \\u00B7 zeroed load in #" + r.scriptEi + " @0x" + r.off.toString(16))
+        : (r.error || r.status);
+      rows += "<tr><td>" + s.stage + "</td><td style='color:" + (good ? "#7ee787" : "#f88") +
+        "'>0x" + r.hash.toString(16).padStart(4, "0") + " \\u00B7 " + r.status + "</td>" +
+        "<td>" + detail + "</td></tr>";
+    });
+  });
+  document.getElementById("swCatSummary").innerHTML =
+    "<table><tr><th>stage</th><th>result</th><th>detail</th></tr>" + rows + "</table>";
+
+  if (out.rebuilt.length % 2048 !== 0){
+    SWAPUI_log("\\u2716 output not sector-aligned", "err"); errCount++;
+  }
+  if (!okCount && errCount){ SWAPUI_fail("Catalog", ["no members were swapped \\u2014 see the table"]); return; }
+  if (!okCount){ SWAPUI_log("nothing swapped (all ticked stages were missing/skipped)", "warn"); return; }
+
+  // commit the rebuilt dir into live state (further swaps/undo stack on it)
+  SWAPUI.psx.dir = out.rebuilt;
+  SWAPUI.psx.outer = psxParseOuter(out.rebuilt);
+  SWAPUI_loadResident();                      /* refresh view (resets gate) */
+  SWAPUI_loadDonor();
+  SWAPUI.rebuilt = out.rebuilt;               /* set AFTER loadResident (which nulls it) */
+  var ub = document.getElementById("swUndo"); if (ub) ub.disabled = false;
+  SWAPUI_gate("done");
+
+  SWAPUI_log("\\u2713 CATALOG DONE: donor 0x" + out.donor.toString(16) + " over " +
+    selected.length + " ticked stage(s) \\u00B7 " + okCount + " member(s) swapped" +
+    (skipCount ? ", " + skipCount + " unticked" : "") +
+    (missCount ? ", " + missCount + " missing" : "") +
+    (errCount ? ", " + errCount + " problem(s)" : "") +
+    " \\u00B7 output " + ((out.rebuilt.length / 1048576 * 10 | 0) / 10) +
+    " MB ready \\u2014 click \\u2B07 Download", errCount ? "warn" : "ok");
 }
 
 function SWAPUI_execute(){
   var plan = SWAPUI.plan;
   if (!plan){ SWAPUI_log("build the plan first", "err"); return; }
+  SWAPUI_snapshot();                 /* capture pre-swap state for Undo */
   try{
     if (SWAPUI.platform === "psx"){
+      // Baseline-aware verification: a previously-modded resident can carry
+      // PRE-EXISTING conflicts (e.g. a texture placed over another's clut by
+      // an earlier tool). Those are inherited, not caused by this swap —
+      // report them, but only conflicts INTRODUCED by the plan block it.
+      // (Blocking on inherited ones forced removing innocent engine/UI
+      // textures just to silence the verifier, which freed poisoned slots.)
+      var beforeSet = {};
+      SWAP_verify(plan._ctx.parsed.entries).problems.forEach(function(p){ beforeSet[p] = 1; });
       var ver = SWAP_verify(plan.entries);
-      if (!ver.ok){ SWAPUI_fail("VRAM verification", ver.problems); return; }
+      var newProblems = ver.problems.filter(function(p){ return !beforeSet[p]; });
+      ver.problems.forEach(function(p){
+        if (beforeSet[p]) SWAPUI_log("\\u26A0 pre-existing (inherited from the loaded resident, " +
+          "not caused by this swap): " + p, "warn");
+      });
+      if (newProblems.length){ SWAPUI_fail("VRAM verification (new conflicts introduced by this plan)", newProblems); return; }
       var blobs = {};
       SWAPUI.psx.outer.stages.forEach(function(s){
         blobs[s.name] = SWAPUI.psx.dir.subarray(s.byteOff, s.byteOff + s.extent);
       });
       blobs[plan._ctx.info.name] = SWAP_rebuildStage(plan._ctx.parsed.headerB64, plan.entries);
+
+      // Option (b): if a stage distribution is pending, rebuild each edited
+      // stage's DAR + stage and override its blob so the overflow textures
+      // ship inside every s/d stage.
+      var pd = SWAPUI._pendingDistribution ||
+               (SWAPUI.plan && SWAPUI.plan._distribution ?
+                 { darEdits: SWAPUI.plan._distribution.darEdits } : null);
+      if (pd && pd.darEdits){
+        var byStage = {};
+        Object.keys(pd.darEdits).forEach(function(key){
+          var slash = key.lastIndexOf("/");
+          var sname = key.substring(0, slash), ei = +key.substring(slash + 1);
+          (byStage[sname] = byStage[sname] || []).push({ ei: ei, items: pd.darEdits[key] });
+        });
+        var distCount = 0;
+        Object.keys(byStage).forEach(function(sname){
+          var st = SWAPUI.psx.outer.stages.filter(function(s){ return s.name === sname; })[0];
+          if (!st) return;
+          var parsed = psxParseStage(SWAPUI.psx.dir.subarray(st.byteOff, st.byteOff + st.extent));
+          var entries = parsed.entries.map(function(e){
+            return { hash: e.hash, mode: e.mode, ext: e.ext, bytes: e.data };
+          });
+          byStage[sname].forEach(function(edit){
+            var items = edit.items.map(function(it){
+              return { hash: it.hash, ext: it.ext, bytes: it.bytes };
+            });
+            entries[edit.ei] = { hash: entries[edit.ei].hash, mode: entries[edit.ei].mode,
+              ext: entries[edit.ei].ext, bytes: psxDarBuild(items) };
+          });
+          blobs[sname] = SWAP_rebuildStage(parsed.headerB64, entries);
+          distCount++;
+        });
+        SWAPUI_log("Applied overflow distribution to " + distCount + " stage(s).", "ok");
+        SWAPUI._pendingDistribution = null;
+      }
       var out = psxRebuildDir({ psx: { headB64: SWAPUI.psx.outer.headB64, stages: SWAPUI.psx.outer.stages } }, blobs);
       var reOuter = psxParseOuter(out);
       var reSt = reOuter.stages.filter(function(s){ return s.name === plan._ctx.info.name; })[0];
       var reParsed = psxParseStage(out.subarray(reSt.byteOff, reSt.byteOff + reSt.extent));
       SWAPUI._afterEntries = reParsed.entries;
+      var _autoCat = document.getElementById('swAutoCatalog');
+      if (_autoCat && _autoCat.checked && SWAPUI.catalog){
+        try{
+          var _catStages = Object.keys(SWAPUI.catalog.stages || {});
+          var _catOut = SWAP_runCatalogPsx(out, SWAPUI.catalog, { selected: _catStages });
+          if (_catOut && _catOut.ok && _catOut.rebuilt){
+            out = _catOut.rebuilt;
+            var _done = 0, _miss = 0;
+            (_catOut.summary||[]).forEach(function(s){
+              if (s.status==='missing') _miss++;
+              else if (s.results) s.results.forEach(function(r){ if (r.status==='kmd-replace'||r.status==='patch-char') _done++; });
+            });
+            SWAPUI_log('\\u2713 auto-catalog: character written into '+_done+' cutscene member(s)'+(_miss?' ('+_miss+' stage(s) not present, skipped)':''), 'ok');
+            var _reSt2 = psxParseOuter(out).stages.filter(function(s){ return s.name === plan._ctx.info.name; })[0];
+            if (_reSt2){ var _rp2 = psxParseStage(out.subarray(_reSt2.byteOff, _reSt2.byteOff + _reSt2.extent)); SWAPUI._afterEntries = _rp2.entries; }
+          }
+        }catch(_e){ SWAPUI_log('auto-catalog skipped: '+_e.message, 'warn'); }
+      }
       SWAPUI_finish(out, SWAP_collectTextures(reParsed.entries), plan);
     } else {
       var afterTexes = SWAP_pcCollect(plan.files);
+      var beforeSet2 = {};
+      SWAP_verifyTexes(SWAP_pcCollect(SWAPUI.pc.files.filter(function(f){
+        return SWAPUI_pcStageOf(f.path) === plan._ctx.name;
+      }))).problems.forEach(function(p){ beforeSet2[p] = 1; });
       var ver2 = SWAP_verifyTexes(afterTexes);
-      if (!ver2.ok){ SWAPUI_fail("VRAM verification", ver2.problems); return; }
+      var newProblems2 = ver2.problems.filter(function(p){ return !beforeSet2[p]; });
+      ver2.problems.forEach(function(p){
+        if (beforeSet2[p]) SWAPUI_log("\\u26A0 pre-existing (inherited from the loaded resident, " +
+          "not caused by this swap): " + p, "warn");
+      });
+      if (newProblems2.length){ SWAPUI_fail("VRAM verification (new conflicts introduced by this plan)", newProblems2); return; }
       var byPath = {};
       plan.files.forEach(function(f){ byPath[f.path] = f.data; });
+      // Option (b) PC: pending stage distribution overrides the ORIGINAL stage
+      // DAR bytes with versions carrying the overflow textures. These paths live
+      // OUTSIDE the selected resident stage, so they flow through the else-branch
+      // pass-through below; we swap in the edited bytes there.
+      var pcDist = SWAPUI._pendingPcDistribution ||
+        (SWAPUI.plan && SWAPUI.plan._pcDistribution ?
+          { fileEdits: SWAPUI.plan._pcDistribution.fileEdits } : null);
+      var distEdits = (pcDist && pcDist.fileEdits) ? pcDist.fileEdits : {};
+      // Stage ALT-model replacement (PC): stage-local cutscene copies of the
+      // player character get the donor KMD so the new character appears there too.
+      var altEdits = {}, altInfo = null;
+      var altEl = document.getElementById("swPcAltModels");
+      var donorKmdBytes = (plan._kmdSwap && plan._kmdSwap.donorBytes) ||
+                          (SWAPUI.donorKmdObj && SWAPUI.donorKmdObj.bytes) || null;
+      if (altEl && altEl.checked && donorKmdBytes){
+        altInfo = SWAP_pcReplaceAltModels(SWAPUI.pc.files, donorKmdBytes, null, SWAPUI_pcStageOf);
+        altEdits = altInfo.fileEdits;
+      }
       var stageName = plan._ctx.name;
       var zip = new JSZip();
       var placedPaths = {};
       SWAPUI.pc.files.forEach(function(f){
-        if (f.path.split("/")[0] === stageName){
+        if (SWAPUI_pcStageOf(f.path) === stageName){
           if (byPath[f.path]){ zip.file(f.path, byPath[f.path]); placedPaths[f.path] = 1; }
           /* paths absent from plan.files were removed (loose deletions) */
+        } else if (distEdits[f.path]){
+          zip.file(f.path, distEdits[f.path]); placedPaths[f.path] = 1;   /* overflow-edited stage DAR */
+        } else if (altEdits[f.path]){
+          zip.file(f.path, altEdits[f.path]); placedPaths[f.path] = 1;    /* alt-model-replaced stage DAR */
         } else zip.file(f.path, f.data);
       });
       plan.files.forEach(function(f){ if (!placedPaths[f.path]) zip.file(f.path, f.data); });
+      var distN = Object.keys(distEdits).length;
+      if (distN){ SWAPUI_log("Applied overflow distribution to " + distN + " stage DAR(s).", "ok"); }
+      if (altInfo && altInfo.replaced){
+        SWAPUI_log("Replaced " + altInfo.replaced + " stage ALT model(s) across " +
+          altInfo.stages.length + " stage(s): " + Object.keys(altInfo.which).join(", "), "ok");
+      }
+      SWAPUI._pendingPcDistribution = null;
+      SWAPUI._afterFiles = plan.files.map(function(f){ return { path: f.path, data: f.data }; });
       zip.generateAsync({ type: "uint8array", compression: "DEFLATE" }).then(function(u8){
         SWAPUI_finish(u8, afterTexes, plan);
       });
@@ -3936,10 +6424,18 @@ function SWAPUI_download(){
 }
 
 function SWAPUI_finish(outBytes, afterTexes, plan){
-  var bad = false, have = {};
+  var bad = false, have = {}, addHash = {};
   afterTexes.forEach(function(t){ have[t.hash] = 1; });
+  plan._adds.forEach(function(a){ addHash[a.hash] = 1; });
   plan._removeSet.forEach(function(h){
-    if (have[h]){ SWAPUI_log("\\u2716 post-check: removed 0x" + h.toString(16) + " still present!", "err"); bad = true; }
+    if (!have[h]) return;
+    if (addHash[h]){
+      /* removed AND re-added under the same hash = replaced in place —
+         the donor's version now lives where the resident's was. Correct. */
+      SWAPUI_log("\\u2713 post-check: 0x" + h.toString(16) + " replaced in place (removed + re-added)", "ok");
+      return;
+    }
+    SWAPUI_log("\\u2716 post-check: removed 0x" + h.toString(16) + " still present!", "err"); bad = true;
   });
   plan._adds.forEach(function(a){
     if (!have[a.hash]){ SWAPUI_log("\\u2716 post-check: added " + a.name + " missing!", "err"); bad = true; }
@@ -3964,6 +6460,16 @@ function SWAPUI_finish(outBytes, afterTexes, plan){
   plan._adds.forEach(function(a){ mark[a.hash] = "new"; });
   SWAPUI.residentTexes = afterTexes;
   SWAPUI_grid("swResGrid", afterTexes, { checkable: true, mark: mark });
+  // commit the swapped bytes into live state so further swaps stack and the
+  // resident/donor rescans see the new content
+  if (SWAPUI.platform === "psx"){
+    SWAPUI.psx.dir = outBytes;
+    SWAPUI.psx.outer = psxParseOuter(outBytes);
+  } else if (SWAPUI._afterFiles){
+    SWAPUI.pc.files = SWAPUI._afterFiles;
+  }
+  var ub = document.getElementById("swUndo");
+  if (ub){ ub.disabled = false; }
   SWAPUI_log("\\u2713 SWAP VERIFIED: " + plan._removeSet.size + " out, " + plan._adds.length +
     " in \\u00B7 zero VRAM conflicts across " + afterTexes.length +
     " textures \\u00B7 output " + ((outBytes.length / 1048576 * 10 | 0) / 10) +
@@ -3987,9 +6493,651 @@ document.addEventListener("DOMContentLoaded", function(){
   pick.parentNode.insertBefore(b, x.nextSibling);
 });
 
+
+// ── VRAM visualizer ──────────────────────────────────────────────────────────
+// Draws the resident (init) VRAM region x640-1024 y0-256 at 2x after a plan,
+// rendering the ACTUAL pixel content of kept textures and planned adds, with
+// a magnified inspect popup on hover (like the Stage Editor VRAM viewer).
+function SWAPUI_texBitmap(bytes){
+  var dec = typeof SWAP_pcxDecodeIndices === "function" ? SWAP_pcxDecodeIndices(bytes) : null;
+  var w, h, i, cv, g, img, o;
+  if (dec){                                          /* 4bpp EGA */
+    w = dec.w; h = dec.h;
+    cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    g = cv.getContext("2d"); img = g.createImageData(w, h);
+    var pal = [];
+    for (i = 0; i < 16; i++){
+      var r = bytes[16 + i * 3], gg = bytes[17 + i * 3], b = bytes[18 + i * 3];
+      pal.push([r, gg, b, (r === 0 && gg === 0 && b === 0) ? 0 : 255]);  /* exact black = transparent */
+    }
+    for (i = 0; i < w * h; i++){
+      var c = pal[dec.px[i]]; o = i * 4;
+      img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = c[3];
+    }
+    g.putImageData(img, 0, 0);
+    return cv;
+  }
+  // 8bpp VGA: single plane, palette in 769-byte trailer starting 0x0C
+  if (bytes && bytes.length > 900 && bytes[0] === 10 && bytes[3] === 8 && bytes[65] === 1){
+    w = (bytes[8] | (bytes[9] << 8)) - (bytes[4] | (bytes[5] << 8)) + 1;
+    h = (bytes[10] | (bytes[11] << 8)) - (bytes[6] | (bytes[7] << 8)) + 1;
+    var bpl = bytes[66] | (bytes[67] << 8);
+    if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return null;
+    var pi = bytes.length - 769;
+    if (bytes[pi] !== 0x0C) return null;
+    var buf = new Uint8Array(bpl * h), p = 128; o = 0;
+    while (o < buf.length && p < pi){
+      var bb = bytes[p++];
+      if ((bb & 0xC0) === 0xC0){ var n = bb & 0x3F, v = bytes[p++]; while (n-- && o < buf.length) buf[o++] = v; }
+      else buf[o++] = bb;
+    }
+    cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    g = cv.getContext("2d"); img = g.createImageData(w, h);
+    for (var y = 0; y < h; y++) for (var x = 0; x < w; x++){
+      var idx = buf[y * bpl + x], po = pi + 1 + idx * 3;
+      o = (y * w + x) * 4;
+      var r2 = bytes[po], g2 = bytes[po + 1], b2 = bytes[po + 2];
+      img.data[o] = r2; img.data[o + 1] = g2; img.data[o + 2] = b2;
+      img.data[o + 3] = (r2 === 0 && g2 === 0 && b2 === 0) ? 0 : 255;
+    }
+    g.putImageData(img, 0, 0);
+    return cv;
+  }
+  return null;
+}
+
+function SWAPUI_vizPopup(){
+  var d = document.getElementById("swVizPop");
+  if (!d){
+    d = document.createElement("div");
+    d.id = "swVizPop";
+    d.style.cssText = "position:fixed;display:none;z-index:9999;pointer-events:none;" +
+      "background:#0d1420;border:1px solid #37a;border-radius:6px;padding:8px;" +
+      "font:11px monospace;color:#cde;box-shadow:0 4px 16px rgba(0,0,0,0.6)";
+    document.body.appendChild(d);
+  }
+  return d;
+}
+
+function SWAPUI_drawVramViz(removeSet, plan, opts){
+  var cv = document.getElementById("swVramViz");
+  if (!cv) return;
+  var g = cv.getContext("2d");
+  var X0 = 640, S = 2;
+  function rx(px){ return (px - X0) * S; }
+  function rect(px, py, w, h, fill, stroke, dash){
+    if (fill){ g.fillStyle = fill; g.fillRect(rx(px), py * S, w * S, h * S); }
+    if (stroke){
+      g.strokeStyle = stroke; g.lineWidth = 1; g.setLineDash(dash || []);
+      g.strokeRect(rx(px) + 0.5, py * S + 0.5, w * S - 1, h * S - 1);
+      g.setLineDash([]);
+    }
+  }
+  function hatch(px, py, w, h, color){
+    g.save(); g.beginPath(); g.rect(rx(px), py * S, w * S, h * S); g.clip();
+    g.strokeStyle = color; g.lineWidth = 1;
+    for (var d = -h * S; d < w * S; d += 8){
+      g.beginPath(); g.moveTo(rx(px) + d, py * S); g.lineTo(rx(px) + d + h * S, (py + h) * S); g.stroke();
+    }
+    g.restore();
+    rect(px, py, w, h, null, color);
+  }
+  cv.style.display = "block";
+  g.imageSmoothingEnabled = false;
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#0a0e14"; g.fillRect(0, 0, cv.width, cv.height);
+  g.strokeStyle = "#182230"; g.lineWidth = 1;
+  for (var gx = 640; gx <= 1024; gx += 64){ g.beginPath(); g.moveTo(rx(gx) + 0.5, 0); g.lineTo(rx(gx) + 0.5, 512); g.stroke(); }
+  for (var gy = 0; gy <= 256; gy += 64){ g.beginPath(); g.moveTo(0, gy * S + 0.5); g.lineTo(768, gy * S + 0.5); g.stroke(); }
+
+  hatch(960, 0, 64, 256, "#445");
+  var kept = SWAPUI.residentTexes.filter(function(t){ return !removeSet.has(t.hash); });
+  var below = 0, at240 = 0;
+  kept.forEach(function(t){ var cy = t.slot.cy;
+    if (cy >= 200 && cy < 240) below++; else if (cy >= 240) at240++; });
+  var integral = below > at240;
+  if (integral){
+    if (opts && opts.paletteRelocated){
+      hatch(768, 226, 192, 14, "#a33");
+      rect(768, 196, 192, 30, "rgba(60,120,60,0.12)", "#3a3");
+    } else hatch(768, 196, 192, 44, "#a33");
+  }
+
+  // build item list for drawing + hover hit-testing (topmost last)
+  var addBytes = {};
+  (plan._adds || []).forEach(function(f){ addBytes[f.name] = f.bytes; });
+  var items = [];
+  SWAPUI.residentTexes.forEach(function(t){
+    if (!removeSet.has(t.hash)) return;
+    var s = t.slot;
+    items.push({ kind: "freed", name: t.name || ("0x" + t.hash.toString(16).padStart(4, "0")),
+      px: s.px, py: s.py, w: s.vw, h: s.h, cx: s.cx, cy: s.cy, bpp: s.bpp, bytes: t.bytes });
+  });
+  kept.forEach(function(t){
+    var s = t.slot;
+    items.push({ kind: "kept", name: t.name || ("0x" + t.hash.toString(16).padStart(4, "0")),
+      px: s.px, py: s.py, w: s.vw, h: s.h, cx: s.cx, cy: s.cy, bpp: s.bpp, bytes: t.bytes });
+  });
+  plan.mapping.forEach(function(m){
+    items.push({ kind: "add", name: m.name,
+      px: m.to.px, py: m.to.py, w: m.w, h: m.h, cx: m.to.cx, cy: m.to.cy, bpp: m.bpp,
+      bytes: addBytes[m.name] || null, from: m.from });
+  });
+
+  // draw: freed outlines, then kept pixels, then add pixels
+  items.forEach(function(it){
+    if (it.kind !== "freed") return;
+    rect(it.px, it.py, it.w, it.h, null, "#e88", [3, 2]);
+  });
+  items.forEach(function(it){
+    if (it.kind === "freed") return;
+    var bmp = it.bytes ? (it._bmp = it._bmp || SWAPUI_texBitmap(it.bytes)) : null;
+    if (bmp) g.drawImage(bmp, rx(it.px), it.py * S, it.w * S, it.h * S);
+    else rect(it.px, it.py, it.w, it.h, it.kind === "add" ? "rgba(230,150,50,0.55)" : "rgba(60,160,90,0.35)", null);
+    rect(it.px, it.py, it.w, it.h, null, it.kind === "add" ? "#fb6" : "rgba(70,200,120,0.6)");
+  });
+  // clut ticks
+  items.forEach(function(it){
+    if (it.kind === "freed") return;
+    rect(it.cx, it.cy, it.kind === "add" ? 16 : (it.bpp === 4 ? 16 : 256), 1,
+      it.kind === "add" ? "#4de" : "#c5c", null);
+  });
+
+  var ly = 520;
+  function key(x, color, label, outlineOnly){
+    if (outlineOnly){ g.strokeStyle = color; g.setLineDash([3, 2]); g.strokeRect(x + 0.5, ly + 0.5, 10, 10); g.setLineDash([]); }
+    else { g.fillStyle = color; g.fillRect(x, ly, 11, 11); }
+    g.fillStyle = "#9ab"; g.font = "10px monospace"; g.fillText(label, x + 15, ly + 9);
+  }
+  key(6, "rgba(60,160,90,0.8)", "kept"); key(70, "#e88", "freed", true);
+  key(140, "rgba(230,150,50,0.9)", "add"); key(196, "#c5c", "kept clut");
+  key(290, "#4de", "add clut"); key(380, "#a33", "engine-blocked");
+  g.fillStyle = "#678"; g.fillText("hover a texture to inspect", 540, ly + 9);
+
+  // hover popup (attach once)
+  SWAPUI._vizItems = items;
+  if (!SWAPUI._vizHover){
+    SWAPUI._vizHover = true;
+    cv.addEventListener("mousemove", function(ev){
+      var b = cv.getBoundingClientRect();
+      var mx = (ev.clientX - b.left) * (cv.width / b.width);
+      var my = (ev.clientY - b.top) * (cv.height / b.height);
+      var vx = mx / S + X0, vy = my / S;                  /* VRAM coords */
+      var list = SWAPUI._vizItems || [], hit = null;
+      for (var i = list.length - 1; i >= 0; i--){          /* topmost first */
+        var it = list[i];
+        if (vx >= it.px && vx < it.px + it.w && vy >= it.py && vy < it.py + it.h){ hit = it; break; }
+      }
+      var pop = SWAPUI_vizPopup();
+      if (!hit){ pop.style.display = "none"; return; }
+      if (pop._for !== hit){
+        pop._for = hit;
+        var tag = hit.kind === "add" ? "#fb6" : hit.kind === "freed" ? "#e88" : "#8e8";
+        var kindTxt = hit.kind === "add" ? "ADD (incoming)" : hit.kind === "freed" ? "REMOVED (freed)" : "KEPT resident";
+        pop.innerHTML = "<div style='color:" + tag + ";font-weight:bold'>" + hit.name + " \\u2014 " + kindTxt + "</div>" +
+          "<div style='color:#9ab;margin:2px 0'>" + hit.w + "\\u00D7" + hit.h + " halfwords \\u00B7 " + (hit.bpp || 4) + "bpp \\u00B7 @" +
+          hit.px + "," + hit.py + " \\u00B7 clut " + hit.cx + "," + hit.cy +
+          (hit.from ? " \\u00B7 donor pos " + hit.from.px + "," + hit.from.py : "") + "</div>";
+        var bmp = hit.bytes ? (hit._bmp = hit._bmp || SWAPUI_texBitmap(hit.bytes)) : null;
+        if (bmp){
+          var z = Math.max(1, Math.min(6, Math.floor(180 / Math.max(bmp.width, bmp.height))));
+          var big = document.createElement("canvas");
+          big.width = bmp.width * z; big.height = bmp.height * z;
+          big.style.cssText = "display:block;margin-top:4px;background:" +
+            "repeating-conic-gradient(#1a2230 0 25%,#141a26 0 50%) 0 0/12px 12px;border:1px solid #345";
+          var bg = big.getContext("2d");
+          bg.imageSmoothingEnabled = false;
+          bg.drawImage(bmp, 0, 0, big.width, big.height);
+          pop.appendChild(big);
+        } else {
+          pop.innerHTML += "<div style='color:#678'>(preview unavailable for this format)</div>";
+        }
+      }
+      var px2 = ev.clientX + 16, py2 = ev.clientY + 16;
+      if (px2 + 220 > window.innerWidth)  px2 = ev.clientX - 236;
+      if (py2 + 260 > window.innerHeight) py2 = ev.clientY - 260;
+      pop.style.left = px2 + "px"; pop.style.top = py2 + "px";
+      pop.style.display = "block";
+    });
+    cv.addEventListener("mouseleave", function(){ SWAPUI_vizPopup().style.display = "none"; });
+  }
+}
+
+// ── Resident-fit overflow dialog (PSX) ──────────────────────────────────────
+// Shown when a swap's textures don't fit the resident area. Two paths:
+//   (a) recommend deletions (protecting global props) so it fits resident;
+//   (b) opt-in: distribute the overflow textures into every s/d stage DAR.
+function SWAPUI_overflowDialog(ctx, removeSet, adds, kmdSwap, swapOpts, failedPlan){
+  // which resident textures does the NEW model still need? (never suggest those)
+  var keepHashes = {};
+  if (SWAPUI.refKmdObjs && SWAPUI.refKmdObjs.length){
+    SWAPUI.refKmdObjs.forEach(function(k){
+      SWAP_kmdHashes(k.bytes).forEach(function(h){ keepHashes[h] = 1; });
+    });
+  }
+  var rec = SWAP_recommendDeletions(SWAPUI.residentTexes, keepHashes, 0);
+
+  var host = document.getElementById("swLog");
+  var box = document.createElement("div");
+  box.style.cssText = "background:#1a1206;border:1px solid #b80;border-radius:6px;padding:12px;margin:8px 0";
+  var recList = rec.recommended.slice(0, 12).map(function(c){
+    return "0x" + c.hash.toString(16).padStart(4,"0") + " (" + Math.round(c.bytes) + "px)";
+  }).join(", ");
+  box.innerHTML =
+    "<div style='color:#fd8;font-weight:bold;margin-bottom:6px'>\\u26A0 Doesn't fit the resident area</div>" +
+    "<div style='color:#dca;font-size:12px;margin-bottom:10px'>The new character's textures need more room than the freed space provides. Pick how to proceed:</div>" +
+    "<div style='margin-bottom:8px'><button id='swOvA' style='background:#243;border:1px solid #6a6;color:#dfd;padding:6px 10px;border-radius:4px;cursor:pointer'>a) Free resident room</button> " +
+    "<span style='color:#9b9;font-size:11px'>auto-selects the largest non-global textures to delete (protects box, codec, ration, HUD\\u2026)</span></div>" +
+    "<div style='color:#ac9;font-size:11px;margin:0 0 10px 14px'>would remove: " + (recList || "(nothing deletable found)") + "</div>" +
+    "<div><button id='swOvB' style='background:#332145;border:1px solid #96c;color:#ecd;padding:6px 10px;border-radius:4px;cursor:pointer'>b) Push overflow into every stage</button> " +
+    "<span style='color:#b9c;font-size:11px'><b>EXPERIMENTAL</b> \\u2014 packs the extra textures into each s/d stage's DAR instead of deleting anything. Bigger file, slower, only correct for stages that load this model.</span></div>";
+  host.appendChild(box);
+  host.scrollTop = host.scrollHeight;
+
+  document.getElementById("swOvA").onclick = function(){
+    box.remove();
+    // tick the recommended hashes in the Step-1 grid, then rebuild
+    var recSet = {};
+    rec.recommended.forEach(function(c){ recSet[c.hash] = 1; });
+    document.querySelectorAll(".swResGridChk").forEach(function(cb){
+      if (recSet[+cb.dataset.hash]){
+        cb.checked = true;
+        if (cb.onchange) cb.onchange();   /* repaint the card border */
+      }
+    });
+    SWAPUI_log("Auto-selected " + rec.recommended.length + " global-safe texture(s) to delete. Rebuilding plan\\u2026", "ok");
+    SWAPUI_buildPlan();
+  };
+
+  document.getElementById("swOvB").onclick = function(){
+    box.remove();
+    if (!confirm("EXPERIMENTAL: push overflow textures into EVERY s/d stage.\\n\\n" +
+      "This edits many stages, makes the STAGE.DIR larger, and only renders correctly " +
+      "in stages that actually load this character. Continue?")) return;
+    SWAPUI_runStageDistribution(ctx, removeSet, adds, kmdSwap, swapOpts);
+  };
+}
+
+// ── PC overflow dialog (parallel to SWAPUI_overflowDialog, PC container) ──
+function SWAPUI_pcOverflowDialog(ctx, removeSet, adds, kmdSwap){
+  var keepHashes = {};
+  if (SWAPUI.refKmdObjs && SWAPUI.refKmdObjs.length){
+    SWAPUI.refKmdObjs.forEach(function(k){
+      SWAP_kmdHashes(k.bytes).forEach(function(h){ keepHashes[h] = 1; });
+    });
+  }
+  var rec = SWAP_recommendDeletions(SWAPUI.residentTexes, keepHashes, 0);
+
+  var host = document.getElementById("swLog");
+  var box = document.createElement("div");
+  box.style.cssText = "background:#1a1206;border:1px solid #b80;border-radius:6px;padding:12px;margin:8px 0";
+  var recList = rec.recommended.slice(0, 12).map(function(c){
+    return (c.name ? c.name : "0x" + c.hash.toString(16).padStart(4,"0")) + " (" + Math.round(c.bytes) + "px)";
+  }).join(", ");
+  box.innerHTML =
+    "<div style='color:#fd8;font-weight:bold;margin-bottom:6px'>\\u26A0 Doesn't fit the resident area (PC)</div>" +
+    "<div style='color:#dca;font-size:12px;margin-bottom:10px'>The new character's textures need more room than the freed space provides. Pick how to proceed:</div>" +
+    "<div style='margin-bottom:8px'><button id='swPcOvA' style='background:#243;border:1px solid #6a6;color:#dfd;padding:6px 10px;border-radius:4px;cursor:pointer'>a) Free resident room</button> " +
+    "<span style='color:#9b9;font-size:11px'>auto-selects the largest non-global textures to delete (protects box, codec, ration, HUD\\u2026)</span></div>" +
+    "<div style='color:#ac9;font-size:11px;margin:0 0 10px 14px'>would remove: " + (recList || "(nothing deletable found)") + "</div>" +
+    "<div><button id='swPcOvB' style='background:#332145;border:1px solid #96c;color:#ecd;padding:6px 10px;border-radius:4px;cursor:pointer'>b) Push overflow into every stage</button> " +
+    "<span style='color:#b9c;font-size:11px'><b>EXPERIMENTAL</b> \\u2014 packs the extra textures into each s/d stage's DAR instead of deleting anything. Bigger file, slower, only correct for stages that load this model.</span></div>";
+  host.appendChild(box);
+  host.scrollTop = host.scrollHeight;
+
+  document.getElementById("swPcOvA").onclick = function(){
+    box.remove();
+    var recSet = {};
+    rec.recommended.forEach(function(c){ recSet[c.hash] = 1; });
+    document.querySelectorAll(".swResGridChk").forEach(function(cb){
+      if (recSet[+cb.dataset.hash]){
+        cb.checked = true;
+        if (cb.onchange) cb.onchange();
+      }
+    });
+    SWAPUI_log("Auto-selected " + rec.recommended.length + " global-safe texture(s) to delete. Rebuilding plan\\u2026", "ok");
+    SWAPUI_buildPlan();
+  };
+
+  document.getElementById("swPcOvB").onclick = function(){
+    box.remove();
+    if (!confirm("EXPERIMENTAL: push overflow textures into EVERY s/d stage.\\n\\n" +
+      "This edits many stages, makes stage.mgz larger, and only renders correctly " +
+      "in stages that actually load this character. Continue?")) return;
+    SWAPUI_pcRunStageDistribution(ctx, removeSet, adds, kmdSwap);
+  };
+}
+
+function SWAPUI_runStageDistribution(ctx, removeSet, adds, kmdSwap, swapOpts){
+  SWAPUI_log("Building the resident-fit remainder\\u2026", "ok");
+  // First, place as many adds as DO fit resident; the rest are the overflow.
+  // Re-run place with a flag capturing which adds failed.
+  var kept = SWAPUI.residentTexes.filter(function(t){ return !removeSet.has(t.hash); });
+  var removed = SWAPUI.residentTexes.filter(function(t){ return removeSet.has(t.hash); });
+  var placed = SWAP_place(kept, removed, adds, swapOpts);
+  var fitHashes = {};
+  placed.mapping.forEach(function(m){ fitHashes[m.hash] = 1; });
+  var overflow = adds.filter(function(a){ return !fitHashes[a.hash]; });
+  if (!overflow.length){
+    SWAPUI_log("Everything fit resident after all \\u2014 no distribution needed. Rebuilding.", "ok");
+    SWAPUI_buildPlan(); return;
+  }
+  SWAPUI_log(overflow.length + " texture(s) overflow to stages: " +
+    overflow.map(function(o){ return "0x" + o.hash.toString(16); }).join(", "), "warn");
+
+  // Parse every stage once
+  var outerParsed = {};
+  SWAPUI.psx.outer.stages.forEach(function(st){
+    outerParsed[st.name] = psxParseStage(
+      SWAPUI.psx.dir.subarray(st.byteOff, st.byteOff + st.extent));
+  });
+  var dist = SWAP_distributeToStages(outerParsed, overflow, function(m,l){ SWAPUI_log(m,l); });
+  var totalStages = dist.stages.filter(function(s){ return s.added > 0; }).length;
+  SWAPUI_log("Distribution: overflow packed into " + totalStages + " stage(s).", "ok");
+  dist.stages.forEach(function(s){
+    if (s.skipped) SWAPUI_log("  " + s.name + ": " + s.added + " added, " + s.skipped + " skipped" +
+      (s.note ? " (" + s.note + ")" : ""), s.skipped ? "warn" : "ok");
+  });
+
+  // Build a REAL resident plan of the FITTING adds only (these are known to
+  // fit, so this plan succeeds), attach the stage distribution, set it as the
+  // active plan, and render the table — same as a normal Build plan so Verify
+  // & swap has a plan to execute.
+  var fittingAdds = adds.filter(function(a){ return fitHashes[a.hash]; });
+  var plan = SWAP_plan(ctx.parsed.entries, removeSet, fittingAdds, kmdSwap, swapOpts);
+  plan.warnings.forEach(function(w){ SWAPUI_log("\\u26A0 " + w, "warn"); });
+  if (!plan.ok){
+    SWAPUI_fail("Resident-remainder plan unexpectedly failed", plan.errors);
+    return;
+  }
+  plan._removeSet = removeSet; plan._adds = fittingAdds; plan._ctx = ctx;
+  plan._kmdSwap = kmdSwap; plan._kmdSwapNote = "";
+  plan._distribution = { overflow: overflow, darEdits: dist.darEdits };
+  SWAPUI.plan = plan;
+  SWAPUI._pendingDistribution = { removeSet: removeSet, fittingAdds: fittingAdds,
+    overflow: overflow, darEdits: dist.darEdits, kmdSwap: kmdSwap, swapOpts: swapOpts, ctx: ctx };
+
+  // render the plan table (resident rows + a distribution summary row)
+  var rows = "";
+  SWAPUI.residentTexes.forEach(function(t){
+    if (!removeSet.has(t.hash)) return;
+    rows += "<tr><td style='color:#e88'>REMOVE</td><td>" + (t.name || "0x" + t.hash.toString(16).padStart(4, "0")) +
+      "</td><td>" + t.slot.vw + "\\u00D7" + t.slot.h + " " + t.slot.bpp + "bpp</td><td>@" + t.slot.px + "," + t.slot.py +
+      " \\u00B7 clut " + t.slot.cx + "," + t.slot.cy + "</td><td>\\u2192 freed</td></tr>";
+  });
+  plan.mapping.forEach(function(m){
+    rows += "<tr><td style='color:#8d8'>ADD</td><td>" + m.name + "</td><td>" + m.w + "\\u00D7" + m.h + " " + m.bpp +
+      "bpp</td><td>(" + m.from.px + "," + m.from.py + ") \\u2192 <b style='color:#cde'>(" + m.to.px + "," + m.to.py +
+      ")</b> \\u00B7 clut \\u2192 (" + m.to.cx + "," + m.to.cy + ")</td><td>resident</td></tr>";
+  });
+  overflow.forEach(function(o){
+    rows += "<tr><td style='color:#c9f'>STAGES</td><td>" + (o.name || "0x" + o.hash.toString(16)) +
+      "</td><td>overflow</td><td colspan='1'>packed into " + totalStages + " s/d stage DAR(s)</td>" +
+      "<td style='color:#b9c'>distributed</td></tr>";
+  });
+  document.getElementById("swPlanTbl").innerHTML =
+    "<table><tr><th></th><th>texture</th><th>size</th><th>placement</th><th>space</th></tr>" + rows + "</table>";
+  SWAPUI_log("\\u2713 plan ready (experimental distribution): " + removeSet.size + " out, " +
+    plan.mapping.length + " resident, " + overflow.length + " into " + totalStages +
+    " stages. Test the model in several stages after swapping. Verify & swap to apply.", "ok");
+  if (SWAPUI.platform === "psx") SWAPUI_drawVramViz(removeSet, plan, swapOpts);
+  SWAPUI_gate("planned");
+}
+
+// ── PC counterpart of SWAPUI_runStageDistribution (option b, PC container) ──
+function SWAPUI_pcRunStageDistribution(ctx, removeSet, adds, kmdSwap){
+  SWAPUI_log("Building the resident-fit remainder\\u2026", "ok");
+  // Recompute which adds fit resident; the rest overflow into stages.
+  var kept    = SWAPUI.residentTexes.filter(function(t){ return !removeSet.has(t.hash); });
+  var removed = SWAPUI.residentTexes.filter(function(t){ return removeSet.has(t.hash); });
+  var placed = SWAP_place(kept, removed, adds);
+  var fitHashes = {};
+  placed.mapping.forEach(function(m){ fitHashes[m.hash] = 1; });
+  var overflow = adds.filter(function(a){ return !fitHashes[a.hash]; });
+  if (!overflow.length){
+    SWAPUI_log("Everything fit resident after all \\u2014 no distribution needed. Rebuilding.", "ok");
+    SWAPUI_buildPlan(); return;
+  }
+  SWAPUI_log(overflow.length + " texture(s) overflow to stages: " +
+    overflow.map(function(o){ return o.name || "0x" + o.hash.toString(16); }).join(", "), "warn");
+
+  // Distribute overflow across every s/d stage's DAR (whole-file edits).
+  var dist = SWAP_pcDistributeToStages(SWAPUI.pc.files, overflow, SWAPUI_pcStageOf,
+    function(m,l){ SWAPUI_log(m,l); });
+  var editedStages = dist.stages.filter(function(s){ return s.added > 0; });
+  var totalStages = editedStages.length;
+  if (!totalStages){
+    SWAPUI_fail("Stage distribution", ["no s/d stage could hold the overflow textures"]);
+    return;
+  }
+  SWAPUI_log("Distribution: overflow packed into " + totalStages + " stage(s).", "ok");
+  dist.stages.forEach(function(s){
+    if (s.skipped) SWAPUI_log("  " + s.name + ": " + s.added + " added, " + s.skipped + " skipped" +
+      (s.note ? " (" + s.note + ")" : ""), s.skipped ? "warn" : "ok");
+  });
+
+  // Build a REAL resident plan of the FITTING adds only (guaranteed to fit).
+  var fittingAdds = adds.filter(function(a){ return fitHashes[a.hash]; });
+  var plan = SWAP_pcPlan(ctx.files, removeSet, fittingAdds, kmdSwap);
+  plan.warnings.forEach(function(w){ SWAPUI_log("\\u26A0 " + w, "warn"); });
+  if (!plan.ok){ SWAPUI_fail("Resident-remainder plan unexpectedly failed", plan.errors); return; }
+  plan._removeSet = removeSet; plan._adds = fittingAdds; plan._ctx = ctx;
+  plan._kmdSwap = kmdSwap; plan._kmdSwapNote = "";
+  plan._pcDistribution = { overflow: overflow, fileEdits: dist.fileEdits };
+  SWAPUI.plan = plan;
+  SWAPUI._pendingPcDistribution = { fileEdits: dist.fileEdits };
+
+  // Plan table: resident rows + a distribution summary.
+  var rows = "";
+  SWAPUI.residentTexes.forEach(function(t){
+    if (!removeSet.has(t.hash)) return;
+    rows += "<tr><td style='color:#e88'>REMOVE</td><td>" + (t.name || "0x" + t.hash.toString(16).padStart(4, "0")) +
+      "</td><td>" + t.slot.vw + "\\u00D7" + t.slot.h + " " + t.slot.bpp + "bpp</td><td>@" + t.slot.px + "," + t.slot.py +
+      " \\u00B7 clut " + t.slot.cx + "," + t.slot.cy + "</td><td>\\u2192 freed</td></tr>";
+  });
+  plan.mapping.forEach(function(m){
+    rows += "<tr><td style='color:#8d8'>ADD</td><td>" + m.name + "</td><td>" + m.w + "\\u00D7" + m.h + " " + m.bpp +
+      "bpp</td><td>(" + m.from.px + "," + m.from.py + ") \\u2192 <b style='color:#cde'>(" + m.to.px + "," + m.to.py +
+      ")</b> \\u00B7 clut \\u2192 (" + m.to.cx + "," + m.to.cy + ")</td><td>resident</td></tr>";
+  });
+  overflow.forEach(function(o){
+    rows += "<tr><td style='color:#c9f'>STAGES</td><td>" + (o.name || "0x" + o.hash.toString(16)) +
+      "</td><td>overflow</td><td colspan='1'>packed into " + totalStages + " s/d stage DAR(s)</td>" +
+      "<td style='color:#b9c'>distributed</td></tr>";
+  });
+  document.getElementById("swPlanTbl").innerHTML =
+    "<table><tr><th></th><th>texture</th><th>size</th><th>placement</th><th>space</th></tr>" + rows + "</table>";
+  SWAPUI_log("\\u2713 plan ready (experimental distribution): " + removeSet.size + " out, " +
+    plan.mapping.length + " resident, " + overflow.length + " into " + totalStages +
+    " stages. Test the model in several stages after swapping. Verify & swap to apply.", "ok");
+  SWAPUI_gate("planned");
+}
+
+// ── KMD → GLB export / import handlers ───────────────────────────────────────
+function SWAPUI_glbStageParsed(){
+  var i = +document.getElementById("glbStage").value;
+  var st = SWAPUI.psx.outer.stages[i];
+  if (!st) return null;
+  return { name: st.name, parsed: psxParseStage(SWAPUI.psx.dir.subarray(st.byteOff, st.byteOff + st.extent)) };
+}
+
+// Build a hash → PCX-bytes map from all texture DARs in a stage (the sibling
+// texture pack, e.g. init\\1_0.dar). PCX/PCC members carry a decodable header.
+function SWAPUI_glbStageTextures(entries){
+  var map = {};
+  entries.forEach(function(e){
+    if (extName(e.ext) !== "dar" || !e.data) return;
+    var members = psxDarParse(e.data);
+    if (!members) return;
+    members.forEach(function(m){
+      if (m.data && m.data.length > 128 && m.data[0] === 0x0A) map[m.hash] = m.data;  // PCX magic
+    });
+  });
+  return map;
+}
+
+function SWAPUI_glbListKmds(){
+  var sp = SWAPUI_glbStageParsed();
+  if (!sp){ SWAPUI_log("pick a stage first", "warn"); return; }
+  var kmds = SWAP_listKmds(sp.parsed.entries);
+  var host = document.getElementById("glbKmdList");
+  host.innerHTML = "";
+  if (!kmds.length){ host.innerHTML = "<span style='color:#987;font-size:11px'>no KMDs in " + sp.name + "</span>"; return; }
+  SWAPUI._glbTexCache = SWAPUI_glbStageTextures(sp.parsed.entries);
+  kmds.forEach(function(k){
+    var refs = SWAP_kmdHashes(k.bytes);
+    var b = document.createElement("button");
+    b.style.cssText = "background:#12242a;border:1px solid #2aa;color:#9fd;padding:6px 10px;border-radius:5px;cursor:pointer;font-size:11px";
+    b.innerHTML = "\\u2B07 " + (k.label || ("0x" + (k.hash||0).toString(16))) + "<br><span style='color:#7aa;font-size:10px'>" + refs.length + " textures</span>";
+    b.onclick = function(){ SWAPUI_glbExport(k, sp.name); };
+    host.appendChild(b);
+  });
+  SWAPUI_log("listed " + kmds.length + " KMD(s) in " + sp.name + " — click one to export its GLB", "ok");
+}
+
+function SWAPUI_glbExport(kmd, stageName){
+  try {
+    var refs = SWAP_kmdHashes(kmd.bytes);
+    var texMap = {};
+    var pend = 0, done = 0;
+    var finalize = function(){
+      var glb = KMD_toGLB(kmd.bytes, texMap);
+      var blob = new Blob([glb], { type: "model/gltf-binary" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = stageName + "_" + (kmd.label || ("0x" + (kmd.hash||0).toString(16))).replace(/[^\\w.-]/g, "_") + ".glb";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+      SWAPUI_log("\\u2713 exported " + a.download + " (" + glb.length + " bytes, " +
+        Object.keys(texMap).length + "/" + refs.length + " textures baked)", "ok");
+    };
+    // bake each referenced texture PCX → PNG via canvas
+    var cache = SWAPUI._glbTexCache || {};
+    var toBake = refs.filter(function(h){ return cache[h]; });
+    if (!toBake.length){ finalize(); return; }
+    toBake.forEach(function(h){
+      var cv = SWAPUI_decodePcx(cache[h]);
+      if (!cv){ return; }
+      // flatten alpha to fully opaque — some importers read a stray 0-alpha
+      // texel as translucency and show the whole model see-through
+      try {
+        var fx = cv.getContext("2d");
+        var id = fx.getImageData(0, 0, cv.width, cv.height);
+        for (var pi = 3; pi < id.data.length; pi += 4) id.data[pi] = 255;
+        fx.putImageData(id, 0, 0);
+      } catch(e){}
+      pend++;
+      cv.toBlob(function(blob){
+        blob.arrayBuffer().then(function(ab){
+          texMap[h] = { png: new Uint8Array(ab) };
+          done++;
+          if (done === pend) finalize();
+        });
+      }, "image/png");
+    });
+    if (pend === 0) finalize();
+  } catch(e){ SWAPUI_log("GLB export failed: " + e.message, "err"); }
+}
+
+function SWAPUI_glbSetupDrop(){
+  var zone = document.getElementById("glbDrop");
+  if (!zone) return;
+  var info = document.getElementById("glbImportInfo");
+  ["dragover","dragenter"].forEach(function(ev){
+    zone.addEventListener(ev, function(e){ e.preventDefault(); zone.style.background = "#0f2020"; });
+  });
+  ["dragleave","drop"].forEach(function(ev){
+    zone.addEventListener(ev, function(e){ e.preventDefault(); zone.style.background = "#0a1414"; });
+  });
+  zone.addEventListener("drop", function(e){
+    e.preventDefault();
+    var f = e.dataTransfer.files[0];
+    if (!f || !/\\.glb$/i.test(f.name)){ info.textContent = "drop a .glb file"; return; }
+    // which KMD does it rebuild? use the currently listed stage's KMD whose
+    // export filename matches, or ask by matching the primitive hashes.
+    info.textContent = "reading GLB\\u2026";
+    f.arrayBuffer().then(function(ab){
+      // defer heavy work one tick so the "reading" text paints (otherwise a
+      // long synchronous encode looks like a freeze)
+      setTimeout(function(){
+        try {
+          var glb = new Uint8Array(ab);
+          var sp = SWAPUI_glbStageParsed();
+          if (!sp){ info.textContent = "pick the source stage above first"; return; }
+          var kmds = SWAP_listKmds(sp.parsed.entries);
+          // match by hash set — use the hardened full parser (handles real
+          // Blender exports: interleaved buffers, uint32 indices, chunk order)
+          var glbInfo = parseGLBFull(glb);
+          var glbHashes = {};
+          glbInfo.triangles.forEach(function(tr){ glbHashes[tr.hash] = 1; });
+          var match = null, bestScore = -1;
+          kmds.forEach(function(k){
+            var refs = SWAP_kmdHashes(k.bytes), score = 0;
+            refs.forEach(function(h){ if (glbHashes[h]) score++; });
+            if (score > bestScore){ bestScore = score; match = k; }
+          });
+          if (!match || bestScore <= 0){
+            info.textContent = "could not match this GLB to a KMD in " + sp.name +
+              " — is the right stage selected? (GLB materials must keep their numeric hash names)";
+            return;
+          }
+          info.textContent = "rebuilding KMD\\u2026";
+          var res = GLB_toKMD(glb, match.bytes);
+          var out = SWAPUI_glbWriteBack(sp, match, res.bytes);
+          info.innerHTML = "\\u2713 rebuilt <b>" + (match.label || ("0x"+(match.hash||0).toString(16))) +
+            "</b> from " + f.name + " (" + res.patchedVerts + " verts, " + res.patchedFaces + " faces). " +
+            (out ? "STAGE.DIR updated — use \\u2B07 Download below." : "");
+          SWAPUI_log("GLB import: rebuilt KMD 0x" + (match.hash||0).toString(16) + " in " + sp.name +
+            " (" + res.patchedVerts + " verts, " + res.patchedFaces + " faces)", "ok");
+        } catch(err){
+          info.textContent = "GLB import failed: " + err.message;
+          SWAPUI_log("GLB import error: " + (err && err.stack ? err.stack : err.message), "err");
+        }
+      }, 30);
+    }).catch(function(err){
+      info.textContent = "could not read the file: " + err.message;
+    });
+  });
+}
+
+// Write a rebuilt KMD's bytes back into its stage entry and refresh the dir.
+function SWAPUI_glbWriteBack(sp, kmd, newBytes){
+  try {
+    var entries = sp.parsed.entries.map(function(e){
+      return { hash: e.hash, mode: e.mode, ext: e.ext, bytes: e.data };
+    });
+    // locate the KMD: it's either a loose entry or a DAR member
+    var placed = false;
+    for (var i = 0; i < entries.length && !placed; i++){
+      if (entries[i].hash === kmd.hash && extName(entries[i].ext) !== "dar"){
+        entries[i].bytes = newBytes; placed = true;
+      } else if (extName(entries[i].ext) === "dar" && entries[i].bytes){
+        var members = psxDarParse(entries[i].bytes);
+        if (members && members.some(function(m){ return m.hash === kmd.hash; })){
+          var mitems = members.map(function(m){
+            return { hash: m.hash, ext: m.ext, bytes: m.hash === kmd.hash ? newBytes : m.data };
+          });
+          entries[i].bytes = psxDarBuild(mitems); placed = true;
+        }
+      }
+    }
+    if (!placed) return false;
+    var blob = SWAP_rebuildStage(sp.parsed.headerB64, entries);
+    var blobs = {};
+    SWAPUI.psx.outer.stages.forEach(function(s){
+      blobs[s.name] = SWAPUI.psx.dir.subarray(s.byteOff, s.byteOff + s.extent);
+    });
+    blobs[sp.name] = blob;
+    SWAPUI.rebuilt = psxRebuildDir({ psx: { headB64: SWAPUI.psx.outer.headB64, stages: SWAPUI.psx.outer.stages } }, blobs);
+    SWAPUI.psx.dir = SWAPUI.rebuilt;
+    SWAPUI.psx.outer = psxParseOuter(SWAPUI.rebuilt);
+    SWAPUI_gate("done");
+    return true;
+  } catch(e){ SWAPUI_log("write-back failed: " + e.message, "err"); return false; }
+}
 <\/script>
 </body>`;
-console.log(ARCHIVE_TOOL_HTML);
 function openArchiveTool(){
   if(document.getElementById('archOverlay')) return;
   var ov=document.createElement('div'); ov.id='archOverlay';
