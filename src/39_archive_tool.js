@@ -2449,7 +2449,6 @@ function reset(){ $("#log").innerHTML=""; }
 function dl(bytes,name){ var b=new Blob([bytes],{type:"application/octet-stream"});
   var a=document.createElement("a"); a.href=URL.createObjectURL(b); a.download=name; a.click();
   setTimeout(function(){URL.revokeObjectURL(a.href);},4000); }
-function eqBytes(a,b){ if(a.length!==b.length)return false; for(var i=0;i<a.length;i++)if(a[i]!==b[i])return false; return true; }
 function normText(u8){ // for GCL unchanged-detection: normalize CRLF→LF + strip trailing ws
   return new TextDecoder().decode(u8).replace(/\\r\\n/g,"\\n").replace(/[ \\t]+\\n/g,"\\n").replace(/\\s+$/,""); }
 function strBytes(s){ return new TextEncoder().encode(s); }
@@ -3952,32 +3951,6 @@ function SWAP_plan(entries, removeSet, addFiles, kmdSwap, opts){
 function SWAP_verify(entries){
   return SWAP_verifyTexes(SWAP_collectTextures(entries));
 }
-function SWAP_verify_OLD(entries){
-  var texes = SWAP_collectTextures(entries);
-  var problems = [], initN = 0, stageN = 0, i, j;
-  for (i = 0; i < texes.length; i++){
-    var a = texes[i].slot;
-    if (a.py < 256) initN++; else stageN++;
-    if (crossesTPage(a.px, a.vw, a.bpp))
-      problems.push("0x" + texes[i].hash.toString(16) + " crosses a TPAGE boundary at x=" + a.px);
-    for (j = i + 1; j < texes.length; j++){
-      var b = texes[j].slot;
-      var ha = "0x" + texes[i].hash.toString(16), hb = "0x" + texes[j].hash.toString(16);
-      if (a.px === b.px && a.py === b.py){ /* intentional shared pair (v82 rule) */ }
-      else if (rectsOverlap(texRect(a), texRect(b)))
-        problems.push("texture overlap: " + ha + " ~ " + hb);
-      if (!(a.cx === b.cx && a.cy === b.cy) && clutsOverlap(a, b))
-        problems.push("CLUT overlap: " + ha + " ~ " + hb);
-      if (rectsOverlap(texRect(a), { x: b.cx, y: b.cy, w: b.nc, h: 1 }))
-        problems.push("texture " + ha + " overlaps CLUT of " + hb);
-      if (rectsOverlap(texRect(b), { x: a.cx, y: a.cy, w: a.nc, h: 1 }))
-        problems.push("texture " + hb + " overlaps CLUT of " + ha);
-    }
-  }
-  return { ok: problems.length === 0, problems: problems,
-    total: texes.length, initCount: initN, stageCount: stageN };
-}
-
 // ── KMD coverage: every texture hash the model references ───────────────────
 function SWAP_kmdHashes(bytes){
   var v = { u16: function(o){ return bytes[o] | (bytes[o + 1] << 8); },
@@ -4601,41 +4574,53 @@ if (typeof module !== "undefined") module.exports = {
 //   - verify no stage VRAM collision before committing; a texture that cannot
 //     be placed cleanly is SKIPPED (reported) rather than overlapped.
 //
+// Shared by SWAP_distributeToStages (PSX) and SWAP_pcDistributeToStages (PC) —
+// both place overflow textures/CLUTs into the same STAGE VRAM region with the
+// same first-fit search, so the finders live here once instead of as
+// duplicate nested closures in each.
+//
+// find a free (px,py) in \`region\` avoiding \`occupied\` tex rects and
+// \`clutRects\` — first-fit, X step 4, Y step 1, TPAGE-safe.
+function STAGE_findFreeTex(region, occupied, clutRects, vw, h, bpp){
+  for (var y = region.y1; y + h <= region.y2; y++){
+    for (var x = region.x1; x + vw <= region.x2; x += 4){
+      if (crossesTPage(x, vw, bpp)) continue;
+      var cand = { x: x, y: y, w: vw, h: h }, ok = true, i;
+      for (i = 0; i < occupied.length; i++)
+        if (rectsOverlap(cand, texRect(occupied[i]))){ ok = false; break; }
+      if (ok) for (i = 0; i < clutRects.length; i++)
+        if (rectsOverlap(cand, { x: clutRects[i].cx, y: clutRects[i].cy, w: clutRects[i].nc, h: 1 })){ ok = false; break; }
+      if (ok) return { px: x, py: y };
+    }
+  }
+  return null;
+}
+// stage CLUT band: 16-aligned x in [512,960), scanned bottom-up from the last row.
+// \`occupiedTex\`, when given, is also avoided — a CLUT must not land on a live
+// stage texture (the PC path opts into this check; PSX keeps its original scope).
+function STAGE_findFreeClut(region, occupiedCluts, nc, occupiedTex){
+  for (var y = region.y2 - 1; y >= region.y1; y--){
+    for (var x = 512; x + nc <= 960; x += 16){
+      var cand = { cx: x, cy: y, nc: nc }, ok = true, i;
+      for (i = 0; i < occupiedCluts.length; i++)
+        if (clutsOverlap(cand, occupiedCluts[i])){ ok = false; break; }
+      if (ok && occupiedTex){
+        var cr = { x: x, y: y, w: nc, h: 1 };
+        for (i = 0; i < occupiedTex.length; i++)
+          if (rectsOverlap(cr, texRect(occupiedTex[i]))){ ok = false; break; }
+      }
+      if (ok) return { cx: x, cy: y };
+    }
+  }
+  return null;
+}
+
 // Returns { stages:[{name,added,skipped,note}], darEdits:{ 'stage/ei': items } }
 function SWAP_distributeToStages(outerParsedByStage, overflowFiles, log){
   var result = { stages: [], darEdits: {} };
   var STAGE = VRAM_REGIONS.stage;   // {x1:0,y1:256,x2:960,y2:512}
-
-  function tpageBad(x, vw, bpp){ return crossesTPage(x, vw, bpp); }
-
-  // find a free (px,py) in the STAGE region avoiding \`occupied\` tex rects and
-  // \`clutRects\` — first-fit, X step 4, Y step 1, TPAGE-safe.
-  function findStageTex(occupied, clutRects, vw, h, bpp){
-    for (var y = STAGE.y1; y + h <= STAGE.y2; y++){
-      for (var x = STAGE.x1; x + vw <= STAGE.x2; x += 4){
-        if (tpageBad(x, vw, bpp)) continue;
-        var cand = { x: x, y: y, w: vw, h: h }, ok = true, i;
-        for (i = 0; i < occupied.length; i++)
-          if (rectsOverlap(cand, texRect(occupied[i]))){ ok = false; break; }
-        if (ok) for (i = 0; i < clutRects.length; i++)
-          if (rectsOverlap(cand, { x: clutRects[i].cx, y: clutRects[i].cy, w: clutRects[i].nc, h: 1 })){ ok = false; break; }
-        if (ok) return { px: x, py: y };
-      }
-    }
-    return null;
-  }
-  // stage CLUT band: 16-aligned x in [512,960), scanned bottom-up from y511.
-  function findStageClut(occupiedCluts, nc){
-    for (var y = STAGE.y2 - 1; y >= STAGE.y1; y--){
-      for (var x = 512; x + nc <= 960; x += 16){
-        var cand = { cx: x, cy: y, nc: nc }, ok = true;
-        for (var i = 0; i < occupiedCluts.length; i++)
-          if (clutsOverlap(cand, occupiedCluts[i])){ ok = false; break; }
-        if (ok) return { cx: x, cy: y };
-      }
-    }
-    return null;
-  }
+  function findStageTex(occupied, clutRects, vw, h, bpp){ return STAGE_findFreeTex(STAGE, occupied, clutRects, vw, h, bpp); }
+  function findStageClut(occupiedCluts, nc){ return STAGE_findFreeClut(STAGE, occupiedCluts, nc); }
 
   var stageNames = Object.keys(outerParsedByStage).filter(function(n){ return /^[sd]\\d/i.test(n); });
 
@@ -5387,59 +5372,8 @@ function parseGLBFull(bytes){
 function clampI16(x){ return x < -32768 ? -32768 : x > 32767 ? 32767 : x; }
 function clampU8(x){ return x < 0 ? 0 : x > 255 ? 255 : x; }
 
-// Minimal GLB parser: returns primitives with decoded positions/uvs + texHash.
-function parseGLB(bytes){
-  var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (dv.getUint32(0, true) !== 0x46546C67) throw new Error("not a GLB");
-  var jsonLen = dv.getUint32(12, true);
-  var jsonStr = new TextDecoder().decode(bytes.subarray(20, 20 + jsonLen));
-  var gltf = JSON.parse(jsonStr);
-  var binOff = 20 + jsonLen + 8;   // skip BIN chunk header
-  var bin = bytes.subarray(binOff);
-
-  function accessorData(ai){
-    var acc = gltf.accessors[ai];
-    var view = gltf.bufferViews[acc.bufferView];
-    var off = (view.byteOffset || 0) + (acc.byteOffset || 0);
-    var comp = { "SCALAR":1, "VEC2":2, "VEC3":3, "VEC4":4 }[acc.type];
-    var n = acc.count * comp;
-    if (acc.componentType === 5126){ var f = new Float32Array(n); var dvv = new DataView(bin.buffer, bin.byteOffset + off);
-      for (var i=0;i<n;i++) f[i]=dvv.getFloat32(i*4,true); return f; }
-    if (acc.componentType === 5123){ var u = new Uint16Array(n); var dvw = new DataView(bin.buffer, bin.byteOffset + off);
-      for (var j=0;j<n;j++) u[j]=dvw.getUint16(j*2,true); return u; }
-    throw new Error("unsupported accessor component " + acc.componentType);
-  }
-
-  var prims = [];
-  (gltf.meshes || []).forEach(function(mesh){
-    mesh.primitives.forEach(function(p){
-      var hash = 0;
-      if (p.material != null && gltf.materials[p.material] && gltf.materials[p.material].extras)
-        hash = gltf.materials[p.material].extras.kmdTexHash || 0;
-      var positions = accessorData(p.attributes.POSITION);
-      var uvs = p.attributes.TEXCOORD_0 != null ? accessorData(p.attributes.TEXCOORD_0) : null;
-      // NOTE: exporter emits quads as 2 tris (0-1-2,0-2-3); the 4 unique verts
-      // are the first 3 of tri1 + last of tri2. We reconstruct per-quad by
-      // reading the index buffer in groups of 6 → 4 unique corners.
-      var idx = accessorData(p.indices);
-      var quadPos = [], quadUv = [];
-      for (var q = 0; q + 6 <= idx.length; q += 6){
-        // buffer corners in export order [3,2,1,0]; reverse to original [0,1,2,3]
-        var bufCorners = [ idx[q], idx[q+1], idx[q+2], idx[q+5] ];
-        var corners = [ bufCorners[3], bufCorners[2], bufCorners[1], bufCorners[0] ];
-        corners.forEach(function(ci){
-          quadPos.push(positions[ci*3], positions[ci*3+1], positions[ci*3+2]);
-          if (uvs) quadUv.push(uvs[ci*2], uvs[ci*2+1]);
-        });
-      }
-      prims.push({ texHash: hash, positions: quadPos, uvs: uvs ? quadUv : null });
-    });
-  });
-  return { primitives: prims };
-}
-
 if (typeof module !== "undefined" && module.exports) module.exports = {
-  KMD_parseBlocks: KMD_parseBlocks, KMD_toGLB: KMD_toGLB, GLB_toKMD: GLB_toKMD, parseGLB: parseGLB, parseGLBFull: parseGLBFull
+  KMD_parseBlocks: KMD_parseBlocks, KMD_toGLB: KMD_toGLB, GLB_toKMD: GLB_toKMD, parseGLBFull: parseGLBFull
 };
 <\/script>
 <script>
@@ -6703,11 +6637,12 @@ function SWAPUI_drawVramViz(removeSet, plan, opts){
   }
 }
 
-// ── Resident-fit overflow dialog (PSX) ──────────────────────────────────────
+// ── Resident-fit overflow dialog (shared by PSX and PC) ─────────────────────
 // Shown when a swap's textures don't fit the resident area. Two paths:
 //   (a) recommend deletions (protecting global props) so it fits resident;
 //   (b) opt-in: distribute the overflow textures into every s/d stage DAR.
-function SWAPUI_overflowDialog(ctx, removeSet, adds, kmdSwap, swapOpts, failedPlan){
+// \`cfg\`: { idPrefix, titleSuffix, containerName, fmtEntry(c), onDistribute() }
+function SWAPUI_overflowDialogCommon(ctx, removeSet, adds, kmdSwap, cfg){
   // which resident textures does the NEW model still need? (never suggest those)
   var keepHashes = {};
   if (SWAPUI.refKmdObjs && SWAPUI.refKmdObjs.length){
@@ -6720,21 +6655,20 @@ function SWAPUI_overflowDialog(ctx, removeSet, adds, kmdSwap, swapOpts, failedPl
   var host = document.getElementById("swLog");
   var box = document.createElement("div");
   box.style.cssText = "background:#1a1206;border:1px solid #b80;border-radius:6px;padding:12px;margin:8px 0";
-  var recList = rec.recommended.slice(0, 12).map(function(c){
-    return "0x" + c.hash.toString(16).padStart(4,"0") + " (" + Math.round(c.bytes) + "px)";
-  }).join(", ");
+  var recList = rec.recommended.slice(0, 12).map(cfg.fmtEntry).join(", ");
+  var idA = cfg.idPrefix + "A", idB = cfg.idPrefix + "B";
   box.innerHTML =
-    "<div style='color:#fd8;font-weight:bold;margin-bottom:6px'>\\u26A0 Doesn't fit the resident area</div>" +
+    "<div style='color:#fd8;font-weight:bold;margin-bottom:6px'>\\u26A0 Doesn't fit the resident area" + cfg.titleSuffix + "</div>" +
     "<div style='color:#dca;font-size:12px;margin-bottom:10px'>The new character's textures need more room than the freed space provides. Pick how to proceed:</div>" +
-    "<div style='margin-bottom:8px'><button id='swOvA' style='background:#243;border:1px solid #6a6;color:#dfd;padding:6px 10px;border-radius:4px;cursor:pointer'>a) Free resident room</button> " +
+    "<div style='margin-bottom:8px'><button id='" + idA + "' style='background:#243;border:1px solid #6a6;color:#dfd;padding:6px 10px;border-radius:4px;cursor:pointer'>a) Free resident room</button> " +
     "<span style='color:#9b9;font-size:11px'>auto-selects the largest non-global textures to delete (protects box, codec, ration, HUD\\u2026)</span></div>" +
     "<div style='color:#ac9;font-size:11px;margin:0 0 10px 14px'>would remove: " + (recList || "(nothing deletable found)") + "</div>" +
-    "<div><button id='swOvB' style='background:#332145;border:1px solid #96c;color:#ecd;padding:6px 10px;border-radius:4px;cursor:pointer'>b) Push overflow into every stage</button> " +
+    "<div><button id='" + idB + "' style='background:#332145;border:1px solid #96c;color:#ecd;padding:6px 10px;border-radius:4px;cursor:pointer'>b) Push overflow into every stage</button> " +
     "<span style='color:#b9c;font-size:11px'><b>EXPERIMENTAL</b> \\u2014 packs the extra textures into each s/d stage's DAR instead of deleting anything. Bigger file, slower, only correct for stages that load this model.</span></div>";
   host.appendChild(box);
   host.scrollTop = host.scrollHeight;
 
-  document.getElementById("swOvA").onclick = function(){
+  document.getElementById(idA).onclick = function(){
     box.remove();
     // tick the recommended hashes in the Step-1 grid, then rebuild
     var recSet = {};
@@ -6749,63 +6683,55 @@ function SWAPUI_overflowDialog(ctx, removeSet, adds, kmdSwap, swapOpts, failedPl
     SWAPUI_buildPlan();
   };
 
-  document.getElementById("swOvB").onclick = function(){
+  document.getElementById(idB).onclick = function(){
     box.remove();
     if (!confirm("EXPERIMENTAL: push overflow textures into EVERY s/d stage.\\n\\n" +
-      "This edits many stages, makes the STAGE.DIR larger, and only renders correctly " +
+      "This edits many stages, makes " + cfg.containerName + " larger, and only renders correctly " +
       "in stages that actually load this character. Continue?")) return;
-    SWAPUI_runStageDistribution(ctx, removeSet, adds, kmdSwap, swapOpts);
+    cfg.onDistribute();
   };
+}
+function SWAPUI_overflowDialog(ctx, removeSet, adds, kmdSwap, swapOpts, failedPlan){
+  SWAPUI_overflowDialogCommon(ctx, removeSet, adds, kmdSwap, {
+    idPrefix: "swOv", titleSuffix: "", containerName: "the STAGE.DIR",
+    fmtEntry: function(c){ return "0x" + c.hash.toString(16).padStart(4,"0") + " (" + Math.round(c.bytes) + "px)"; },
+    onDistribute: function(){ SWAPUI_runStageDistribution(ctx, removeSet, adds, kmdSwap, swapOpts); }
+  });
 }
 
 // ── PC overflow dialog (parallel to SWAPUI_overflowDialog, PC container) ──
 function SWAPUI_pcOverflowDialog(ctx, removeSet, adds, kmdSwap){
-  var keepHashes = {};
-  if (SWAPUI.refKmdObjs && SWAPUI.refKmdObjs.length){
-    SWAPUI.refKmdObjs.forEach(function(k){
-      SWAP_kmdHashes(k.bytes).forEach(function(h){ keepHashes[h] = 1; });
-    });
-  }
-  var rec = SWAP_recommendDeletions(SWAPUI.residentTexes, keepHashes, 0);
+  SWAPUI_overflowDialogCommon(ctx, removeSet, adds, kmdSwap, {
+    idPrefix: "swPcOv", titleSuffix: " (PC)", containerName: "stage.mgz",
+    fmtEntry: function(c){ return (c.name ? c.name : "0x" + c.hash.toString(16).padStart(4,"0")) + " (" + Math.round(c.bytes) + "px)"; },
+    onDistribute: function(){ SWAPUI_pcRunStageDistribution(ctx, removeSet, adds, kmdSwap); }
+  });
+}
 
-  var host = document.getElementById("swLog");
-  var box = document.createElement("div");
-  box.style.cssText = "background:#1a1206;border:1px solid #b80;border-radius:6px;padding:12px;margin:8px 0";
-  var recList = rec.recommended.slice(0, 12).map(function(c){
-    return (c.name ? c.name : "0x" + c.hash.toString(16).padStart(4,"0")) + " (" + Math.round(c.bytes) + "px)";
-  }).join(", ");
-  box.innerHTML =
-    "<div style='color:#fd8;font-weight:bold;margin-bottom:6px'>\\u26A0 Doesn't fit the resident area (PC)</div>" +
-    "<div style='color:#dca;font-size:12px;margin-bottom:10px'>The new character's textures need more room than the freed space provides. Pick how to proceed:</div>" +
-    "<div style='margin-bottom:8px'><button id='swPcOvA' style='background:#243;border:1px solid #6a6;color:#dfd;padding:6px 10px;border-radius:4px;cursor:pointer'>a) Free resident room</button> " +
-    "<span style='color:#9b9;font-size:11px'>auto-selects the largest non-global textures to delete (protects box, codec, ration, HUD\\u2026)</span></div>" +
-    "<div style='color:#ac9;font-size:11px;margin:0 0 10px 14px'>would remove: " + (recList || "(nothing deletable found)") + "</div>" +
-    "<div><button id='swPcOvB' style='background:#332145;border:1px solid #96c;color:#ecd;padding:6px 10px;border-radius:4px;cursor:pointer'>b) Push overflow into every stage</button> " +
-    "<span style='color:#b9c;font-size:11px'><b>EXPERIMENTAL</b> \\u2014 packs the extra textures into each s/d stage's DAR instead of deleting anything. Bigger file, slower, only correct for stages that load this model.</span></div>";
-  host.appendChild(box);
-  host.scrollTop = host.scrollHeight;
-
-  document.getElementById("swPcOvA").onclick = function(){
-    box.remove();
-    var recSet = {};
-    rec.recommended.forEach(function(c){ recSet[c.hash] = 1; });
-    document.querySelectorAll(".swResGridChk").forEach(function(cb){
-      if (recSet[+cb.dataset.hash]){
-        cb.checked = true;
-        if (cb.onchange) cb.onchange();
-      }
-    });
-    SWAPUI_log("Auto-selected " + rec.recommended.length + " global-safe texture(s) to delete. Rebuilding plan\\u2026", "ok");
-    SWAPUI_buildPlan();
-  };
-
-  document.getElementById("swPcOvB").onclick = function(){
-    box.remove();
-    if (!confirm("EXPERIMENTAL: push overflow textures into EVERY s/d stage.\\n\\n" +
-      "This edits many stages, makes stage.mgz larger, and only renders correctly " +
-      "in stages that actually load this character. Continue?")) return;
-    SWAPUI_pcRunStageDistribution(ctx, removeSet, adds, kmdSwap);
-  };
+// Renders the "resident rows + distribution summary" plan table shared by
+// SWAPUI_runStageDistribution (PSX) and SWAPUI_pcRunStageDistribution (PC) —
+// the two callers build the plan differently, but the table markup itself
+// was identical in both, so it lives here once.
+function SWAPUI_renderDistributionPlanTable(removeSet, plan, overflow, totalStages){
+  var rows = "";
+  SWAPUI.residentTexes.forEach(function(t){
+    if (!removeSet.has(t.hash)) return;
+    rows += "<tr><td style='color:#e88'>REMOVE</td><td>" + (t.name || "0x" + t.hash.toString(16).padStart(4, "0")) +
+      "</td><td>" + t.slot.vw + "\\u00D7" + t.slot.h + " " + t.slot.bpp + "bpp</td><td>@" + t.slot.px + "," + t.slot.py +
+      " \\u00B7 clut " + t.slot.cx + "," + t.slot.cy + "</td><td>\\u2192 freed</td></tr>";
+  });
+  plan.mapping.forEach(function(m){
+    rows += "<tr><td style='color:#8d8'>ADD</td><td>" + m.name + "</td><td>" + m.w + "\\u00D7" + m.h + " " + m.bpp +
+      "bpp</td><td>(" + m.from.px + "," + m.from.py + ") \\u2192 <b style='color:#cde'>(" + m.to.px + "," + m.to.py +
+      ")</b> \\u00B7 clut \\u2192 (" + m.to.cx + "," + m.to.cy + ")</td><td>resident</td></tr>";
+  });
+  overflow.forEach(function(o){
+    rows += "<tr><td style='color:#c9f'>STAGES</td><td>" + (o.name || "0x" + o.hash.toString(16)) +
+      "</td><td>overflow</td><td colspan='1'>packed into " + totalStages + " s/d stage DAR(s)</td>" +
+      "<td style='color:#b9c'>distributed</td></tr>";
+  });
+  document.getElementById("swPlanTbl").innerHTML =
+    "<table><tr><th></th><th>texture</th><th>size</th><th>placement</th><th>space</th></tr>" + rows + "</table>";
 }
 
 function SWAPUI_runStageDistribution(ctx, removeSet, adds, kmdSwap, swapOpts){
@@ -6857,26 +6783,7 @@ function SWAPUI_runStageDistribution(ctx, removeSet, adds, kmdSwap, swapOpts){
   SWAPUI._pendingDistribution = { removeSet: removeSet, fittingAdds: fittingAdds,
     overflow: overflow, darEdits: dist.darEdits, kmdSwap: kmdSwap, swapOpts: swapOpts, ctx: ctx };
 
-  // render the plan table (resident rows + a distribution summary row)
-  var rows = "";
-  SWAPUI.residentTexes.forEach(function(t){
-    if (!removeSet.has(t.hash)) return;
-    rows += "<tr><td style='color:#e88'>REMOVE</td><td>" + (t.name || "0x" + t.hash.toString(16).padStart(4, "0")) +
-      "</td><td>" + t.slot.vw + "\\u00D7" + t.slot.h + " " + t.slot.bpp + "bpp</td><td>@" + t.slot.px + "," + t.slot.py +
-      " \\u00B7 clut " + t.slot.cx + "," + t.slot.cy + "</td><td>\\u2192 freed</td></tr>";
-  });
-  plan.mapping.forEach(function(m){
-    rows += "<tr><td style='color:#8d8'>ADD</td><td>" + m.name + "</td><td>" + m.w + "\\u00D7" + m.h + " " + m.bpp +
-      "bpp</td><td>(" + m.from.px + "," + m.from.py + ") \\u2192 <b style='color:#cde'>(" + m.to.px + "," + m.to.py +
-      ")</b> \\u00B7 clut \\u2192 (" + m.to.cx + "," + m.to.cy + ")</td><td>resident</td></tr>";
-  });
-  overflow.forEach(function(o){
-    rows += "<tr><td style='color:#c9f'>STAGES</td><td>" + (o.name || "0x" + o.hash.toString(16)) +
-      "</td><td>overflow</td><td colspan='1'>packed into " + totalStages + " s/d stage DAR(s)</td>" +
-      "<td style='color:#b9c'>distributed</td></tr>";
-  });
-  document.getElementById("swPlanTbl").innerHTML =
-    "<table><tr><th></th><th>texture</th><th>size</th><th>placement</th><th>space</th></tr>" + rows + "</table>";
+  SWAPUI_renderDistributionPlanTable(removeSet, plan, overflow, totalStages);
   SWAPUI_log("\\u2713 plan ready (experimental distribution): " + removeSet.size + " out, " +
     plan.mapping.length + " resident, " + overflow.length + " into " + totalStages +
     " stages. Test the model in several stages after swapping. Verify & swap to apply.", "ok");
@@ -6927,26 +6834,7 @@ function SWAPUI_pcRunStageDistribution(ctx, removeSet, adds, kmdSwap){
   SWAPUI.plan = plan;
   SWAPUI._pendingPcDistribution = { fileEdits: dist.fileEdits };
 
-  // Plan table: resident rows + a distribution summary.
-  var rows = "";
-  SWAPUI.residentTexes.forEach(function(t){
-    if (!removeSet.has(t.hash)) return;
-    rows += "<tr><td style='color:#e88'>REMOVE</td><td>" + (t.name || "0x" + t.hash.toString(16).padStart(4, "0")) +
-      "</td><td>" + t.slot.vw + "\\u00D7" + t.slot.h + " " + t.slot.bpp + "bpp</td><td>@" + t.slot.px + "," + t.slot.py +
-      " \\u00B7 clut " + t.slot.cx + "," + t.slot.cy + "</td><td>\\u2192 freed</td></tr>";
-  });
-  plan.mapping.forEach(function(m){
-    rows += "<tr><td style='color:#8d8'>ADD</td><td>" + m.name + "</td><td>" + m.w + "\\u00D7" + m.h + " " + m.bpp +
-      "bpp</td><td>(" + m.from.px + "," + m.from.py + ") \\u2192 <b style='color:#cde'>(" + m.to.px + "," + m.to.py +
-      ")</b> \\u00B7 clut \\u2192 (" + m.to.cx + "," + m.to.cy + ")</td><td>resident</td></tr>";
-  });
-  overflow.forEach(function(o){
-    rows += "<tr><td style='color:#c9f'>STAGES</td><td>" + (o.name || "0x" + o.hash.toString(16)) +
-      "</td><td>overflow</td><td colspan='1'>packed into " + totalStages + " s/d stage DAR(s)</td>" +
-      "<td style='color:#b9c'>distributed</td></tr>";
-  });
-  document.getElementById("swPlanTbl").innerHTML =
-    "<table><tr><th></th><th>texture</th><th>size</th><th>placement</th><th>space</th></tr>" + rows + "</table>";
+  SWAPUI_renderDistributionPlanTable(removeSet, plan, overflow, totalStages);
   SWAPUI_log("\\u2713 plan ready (experimental distribution): " + removeSet.size + " out, " +
     plan.mapping.length + " resident, " + overflow.length + " into " + totalStages +
     " stages. Test the model in several stages after swapping. Verify & swap to apply.", "ok");

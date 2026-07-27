@@ -683,6 +683,13 @@ document.getElementById("app").innerHTML=
       +'<p style="color:#aac;font-size:10px;line-height:1.4;margin-bottom:10px">Edit weapon/item menu pictures (item.rpk) &amp; rename menu labels</p>'
       +'<p style="color:#778;font-size:9px;font-style:italic">.rpk / init.stg / EXE</p>'
     +'</div>'
+    // PC PATCHER TILE
+    +'<div id="tilePcPatcher" style="width:220px;cursor:pointer;background:rgba(8,12,18,0.92);border:2px solid #f0b429;box-shadow:0 8px 32px rgba(0,0,0,0.8),0 0 0 1px rgba(240,180,41,0.3);padding:24px;border-radius:6px;text-align:center;transition:transform 0.15s,border-color 0.15s" onmouseover="this.style.transform=\'translateY(-3px)\';this.style.borderColor=\'#ffc63f\'" onmouseout="this.style.transform=\'\';this.style.borderColor=\'#f0b429\'">'
+      +'<div style="font-size:38px;margin-bottom:8px">🩹</div>'
+      +'<h2 style="color:#f0b429;font-size:14px;margin-bottom:6px;letter-spacing:1px">PC Patcher</h2>'
+      +'<p style="color:#aac;font-size:10px;line-height:1.4;margin-bottom:10px">Expand the mgsi.exe texture table 512 &#8594; 1024 slots — fixes crashes from swapped-in characters</p>'
+      +'<p style="color:#778;font-size:9px;font-style:italic">mgsi.exe (SLPM-86247 Integral)</p>'
+    +'</div>'
   +'</div>'
 +'</div>'
 +'<input type="file" id="fi" accept=".hzm" multiple style="display:none">'
@@ -698,6 +705,7 @@ document.getElementById("tileCodec").onclick=function(){openCodecEditor()};
 document.getElementById("tileSgt").onclick=function(){openSgtEditor()};
 document.getElementById("tileRpk").onclick=function(){openRpkStudio()};
 document.getElementById("tileArch").onclick=function(){openArchiveTool()};
+document.getElementById("tilePcPatcher").onclick=function(){openPcPatcher()};
 document.getElementById("fi").onchange=function(e){if(e.target.files.length>0)hFiles(e.target.files)}}
 
 // ===== Sight (.sgt) Editor — embedded standalone tool, isolated in an iframe =====

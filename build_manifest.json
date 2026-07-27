@@ -245,6 +245,11 @@
   {
    "file": "src/39_archive_tool.js",
    "kind": "app",
+   "sep_after": "\n"
+  },
+  {
+   "file": "src/40_pc_patcher.js",
+   "kind": "app",
    "sep_after": ""
   }
  ]

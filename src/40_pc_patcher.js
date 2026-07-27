@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+var PC_PATCHER_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -79,12 +79,24 @@
   ol{margin:8px 0 0;padding-left:20px;font-size:13px}
   ol li{margin:5px 0}
   code{color:var(--amber)}
+  .topbar{display:flex;align-items:baseline;gap:12px;margin-bottom:4px}
+  .topbar .spacer{flex:1}
+  .btn.ghost{
+    font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+    background:transparent;color:var(--dim);border:1px solid var(--line);
+    padding:6px 12px;cursor:pointer;font-weight:600;margin:0;
+  }
+  .btn.ghost:hover{border-color:var(--amber);color:var(--amber);background:transparent}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
 <body>
 <div class="wrap">
 
+  <div class="topbar">
+    <span class="spacer"></span>
+    <button class="btn ghost" id="exitBtn" title="Return to the mod suite">Exit</button>
+  </div>
   <h1>MGS1 PC · texture table expansion</h1>
   <p class="sub">Patches <b>mgsi.exe</b> so the texture table holds 1024 entries instead of 512.
      Stops the crashes in busy stages (s03a and friends) when swapped-in characters push the
@@ -242,6 +254,26 @@ fileIn.onchange=function(){ if(fileIn.files[0]) handle(fileIn.files[0]); };
 drop.addEventListener('drop',function(e){
   if(e.dataTransfer.files[0]) handle(e.dataTransfer.files[0]);
 });
-</script>
+
+document.getElementById('exitBtn').onclick=function(){
+  // when embedded in the mod suite, the host sets window.PATCHER_HOST_EXIT to
+  // navigate back to its landing page
+  if(typeof window.PATCHER_HOST_EXIT==='function'){ window.PATCHER_HOST_EXIT(); return; }
+  // standalone fallback: nothing to return to, so just clear the output
+  out.innerHTML='';
+};
+<\/script>
 </body>
 </html>
+`;
+function openPcPatcher(){
+  if(document.getElementById('patcherOverlay')) return;
+  var ov=document.createElement('div'); ov.id='patcherOverlay';
+  ov.style.cssText='position:fixed;inset:0;z-index:99999;background:#0a0c10';
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='border:0;width:100%;height:100%;display:block';
+  ifr.srcdoc=PC_PATCHER_HTML;
+  ifr.onload=function(){ try{ ifr.contentWindow.PATCHER_HOST_EXIT=function(){ closePcPatcher(); }; }catch(e){} };
+  ov.appendChild(ifr); document.body.appendChild(ov);
+}
+function closePcPatcher(){ var ov=document.getElementById('patcherOverlay'); if(ov) ov.remove(); }
