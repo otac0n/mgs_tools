@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MGS1 PC — texture table expansion patcher</title>
+<style>
+  :root{
+    --ink:#0b0f0d;          /* deep codec black-green */
+    --panel:#121a16;
+    --line:#25332b;
+    --dim:#6f8a7c;
+    --text:#c8dcd0;
+    --amber:#f0b429;        /* codec amber — used for the signature + actions */
+    --sig:#4ce39a;          /* live/ok */
+    --alert:#e2564d;
+    --mono:"Consolas","DejaVu Sans Mono",ui-monospace,monospace;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--ink); color:var(--text);
+    font-family:var(--mono); font-size:14px; line-height:1.55;
+    padding:28px 20px 60px;
+  }
+  .wrap{max-width:840px;margin:0 auto}
+  h1{
+    font-size:19px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--text); margin:0 0 4px; font-weight:600;
+  }
+  .sub{color:var(--dim); font-size:12.5px; margin:0 0 24px}
+  .sub b{color:var(--amber);font-weight:600}
+
+  /* ── signature: the table doubling, drawn as real slots ── */
+  .slots{border:1px solid var(--line);background:var(--panel);padding:14px 16px;margin:0 0 22px}
+  .slotrow{display:flex;align-items:center;gap:12px;margin:7px 0}
+  .slotlab{width:104px;flex:0 0 104px;font-size:11px;letter-spacing:.08em;color:var(--dim);text-transform:uppercase}
+  .grid{flex:1;height:16px;display:flex;gap:1px;overflow:hidden}
+  .cell{flex:1;background:#1d2b23}
+  .cell.on{background:var(--sig)}
+  .cell.new{background:var(--amber)}
+  .slotnum{width:96px;flex:0 0 96px;text-align:right;font-size:12px;color:var(--dim)}
+  .slotnum b{color:var(--text);font-weight:600}
+  .capnote{font-size:11.5px;color:var(--dim);margin:10px 0 0;padding-top:9px;border-top:1px solid var(--line)}
+
+  /* ── drop target ── */
+  #drop{
+    border:1px dashed #35473c; background:var(--panel);
+    padding:38px 20px; text-align:center; cursor:pointer;
+    transition:border-color .12s, background .12s;
+  }
+  #drop:hover,#drop.hot{border-color:var(--amber);background:#161f1a}
+  #drop.hot{border-style:solid}
+  #drop .big{font-size:15px;color:var(--text);letter-spacing:.04em}
+  #drop .small{font-size:12px;color:var(--dim);margin-top:7px}
+  #drop:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+  input[type=file]{display:none}
+
+  #out{margin-top:22px}
+  .card{border:1px solid var(--line);background:var(--panel);padding:15px 17px;margin-bottom:12px}
+  .card.ok{border-left:3px solid var(--sig)}
+  .card.bad{border-left:3px solid var(--alert)}
+  .card.warn{border-left:3px solid var(--amber)}
+  .card h2{margin:0 0 8px;font-size:13px;letter-spacing:.1em;text-transform:uppercase;font-weight:600}
+  .ok h2{color:var(--sig)} .bad h2{color:var(--alert)} .warn h2{color:var(--amber)}
+  .card p{margin:6px 0;font-size:13px}
+  table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+  th{text-align:left;color:var(--dim);font-weight:500;padding:4px 8px 4px 0;
+     border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.07em;text-transform:uppercase}
+  td{padding:3px 8px 3px 0;border-bottom:1px solid #1a241e;color:var(--text)}
+  td.was{color:var(--dim)}
+  td.now{color:var(--sig)}
+  button{
+    font-family:var(--mono);font-size:13px;letter-spacing:.06em;
+    background:var(--amber);color:#1a1205;border:none;padding:11px 20px;
+    cursor:pointer;font-weight:700;margin-top:14px;text-transform:uppercase;
+  }
+  button:hover{background:#ffc63f}
+  button:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+  ol{margin:8px 0 0;padding-left:20px;font-size:13px}
+  ol li{margin:5px 0}
+  code{color:var(--amber)}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>MGS1 PC · texture table expansion</h1>
+  <p class="sub">Patches <b>mgsi.exe</b> so the texture table holds 1024 entries instead of 512.
+     Stops the crashes in busy stages (s03a and friends) when swapped-in characters push the
+     table past its original limit.</p>
+
+  <!-- signature: what the patch actually does, drawn to scale -->
+  <div class="slots">
+    <div class="slotrow">
+      <span class="slotlab">Stock</span>
+      <span class="grid" id="gridA"></span>
+      <span class="slotnum"><b>512</b> slots</span>
+    </div>
+    <div class="slotrow">
+      <span class="slotlab">Patched</span>
+      <span class="grid" id="gridB"></span>
+      <span class="slotnum"><b>1024</b> slots</span>
+    </div>
+    <p class="capnote">12 bytes per entry, so the table grows 6&nbsp;KB → 12&nbsp;KB. It moves to unused
+       zero-filled space further up in <code>.data</code>; nothing else in the exe moves, and no file
+       data is relocated — only the 16 operand bytes that name the table's address and size.</p>
+  </div>
+
+  <div id="drop" tabindex="0" role="button" aria-label="Choose or drop mgsi.exe">
+    <div class="big">Drop <b>mgsi.exe</b> here</div>
+    <div class="small">or click to choose it &nbsp;·&nbsp; nothing is uploaded, patching happens in your browser</div>
+  </div>
+  <input type="file" id="file" accept=".exe">
+
+  <div id="out"></div>
+</div>
+
+<script>
+/* ── the patch: 8 operand sites, 16 bytes. Verified byte-identical to the
+      known-good build that was tested in game. ───────────────────────────── */
+var PATCH = [
+  {off:0x002488, was:"20bb7800", now:"40b87d00", what:"clear-loop table base"},
+  {off:0x00248d, was:"00020000", now:"00040000", what:"clear-loop entry count"},
+  {off:0x0024d7, was:"00020000", now:"00040000", what:"hash modulus"},
+  {off:0x0024e7, was:"20bb7800", now:"40b87d00", what:"lookup table base"},
+  {off:0x0024fe, was:"00020000", now:"00040000", what:"probe wrap limit"},
+  {off:0x002505, was:"20bb7800", now:"40b87d00", what:"probe wrap base"},
+  {off:0x0026f8, was:"20bb7800", now:"40b87d00", what:"secondary lookup base"},
+  {off:0x0026fd, was:"00020000", now:"00040000", what:"secondary count"}
+];
+var CS_OFF = 0x140;          // PE OptionalHeader.CheckSum
+var EXPECT_SIZE = 2883584;   // retail mgsi.exe (SLPM-86247 Integral)
+
+function hexToBytes(h){var a=[];for(var i=0;i<h.length;i+=2)a.push(parseInt(h.substr(i,2),16));return a;}
+function bytesMatch(buf,off,hex){
+  var b=hexToBytes(hex);
+  for(var i=0;i<b.length;i++) if(buf[off+i]!==b[i]) return false;
+  return true;
+}
+function peChecksum(b){
+  var s=0, n=b.length & ~1;
+  for(var i=0;i<n;i+=2){
+    var w = (i===CS_OFF || i===CS_OFF+2) ? 0 : (b[i] | (b[i+1]<<8));
+    s += w; s = (s & 0xffff) + (s >>> 16);
+  }
+  if(b.length & 1){ s += b[b.length-1]; s = (s & 0xffff) + (s >>> 16); }
+  s = (s & 0xffff) + (s >>> 16);
+  return ((s + b.length) >>> 0);
+}
+
+/* signature grid — 64 cells per row, second row shows the 512 gained */
+(function(){
+  var a=document.getElementById('gridA'), b=document.getElementById('gridB');
+  for(var i=0;i<64;i++){
+    var c=document.createElement('span'); c.className='cell'+(i<32?' on':''); a.appendChild(c);
+    var d=document.createElement('span'); d.className='cell'+(i<32?' on':' new'); b.appendChild(d);
+  }
+})();
+
+var out=document.getElementById('out');
+function card(kind,title,html){
+  var d=document.createElement('div'); d.className='card '+kind;
+  d.innerHTML='<h2>'+title+'</h2>'+html; out.appendChild(d); return d;
+}
+
+function handle(file){
+  out.innerHTML='';
+  var fr=new FileReader();
+  fr.onload=function(){
+    var buf=new Uint8Array(fr.result);
+
+    /* ── identify the file before touching it ── */
+    if(buf.length!==EXPECT_SIZE){
+      card('bad','Not the expected mgsi.exe',
+        '<p>This file is '+buf.length.toLocaleString()+' bytes. The retail <code>mgsi.exe</code> this patch '+
+        'targets is '+EXPECT_SIZE.toLocaleString()+' bytes (SLPM-86247 Integral).</p>'+
+        '<p>Nothing was changed. Check you picked <code>mgsi.exe</code> from your game folder, and that it is '+
+        'an unmodified copy.</p>');
+      return;
+    }
+    var stockHits=0, patchedHits=0;
+    PATCH.forEach(function(p){
+      if(bytesMatch(buf,p.off,p.was)) stockHits++;
+      else if(bytesMatch(buf,p.off,p.now)) patchedHits++;
+    });
+
+    if(patchedHits===PATCH.length){
+      card('warn','Already patched',
+        '<p>All 8 sites already hold the 1024-entry values. This exe has the expansion — you can use it as is.</p>');
+      return;
+    }
+    if(stockHits!==PATCH.length){
+      card('bad','Unrecognised executable',
+        '<p>The file is the right size, but '+(PATCH.length-stockHits-patchedHits)+' of 8 patch sites do not contain '+
+        'the expected bytes. It may be a different release, or already modified by another tool.</p>'+
+        '<p>Nothing was changed. Patch a clean <code>mgsi.exe</code>, then apply other mods after.</p>');
+      return;
+    }
+
+    /* ── apply ── */
+    var o=buf.slice();
+    var rows='';
+    PATCH.forEach(function(p){
+      var b=hexToBytes(p.now);
+      for(var i=0;i<b.length;i++) o[p.off+i]=b[i];
+      rows+='<tr><td>0x'+p.off.toString(16).padStart(6,'0')+'</td><td>'+p.what+'</td>'+
+            '<td class="was">'+p.was+'</td><td class="now">'+p.now+'</td></tr>';
+    });
+    var cs=peChecksum(o);
+    o[CS_OFF]=cs&0xff; o[CS_OFF+1]=(cs>>>8)&0xff; o[CS_OFF+2]=(cs>>>16)&0xff; o[CS_OFF+3]=(cs>>>24)&0xff;
+
+    var c=card('ok','Patched · 16 bytes across 8 sites',
+      '<p>Texture table moved to free space and doubled to 1024 entries. The PE checksum was recalculated.</p>'+
+      '<table><thead><tr><th>Offset</th><th>Site</th><th>Was</th><th>Now</th></tr></thead><tbody>'+rows+'</tbody></table>'+
+      '<p style="margin-top:14px">Next: back up your original <code>mgsi.exe</code>, drop this one in its place, '+
+      'then use the Archive Tool to swap characters.</p>');
+
+    var btn=document.createElement('button');
+    btn.textContent='Download patched mgsi.exe';
+    btn.onclick=function(){
+      var a=document.createElement('a');
+      a.href=URL.createObjectURL(new Blob([o],{type:'application/octet-stream'}));
+      a.download='mgsi.exe'; a.click();
+      setTimeout(function(){URL.revokeObjectURL(a.href);},4000);
+    };
+    c.appendChild(btn);
+  };
+  fr.readAsArrayBuffer(file);
+}
+
+var drop=document.getElementById('drop'), fileIn=document.getElementById('file');
+drop.onclick=function(){fileIn.click();};
+drop.onkeydown=function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();fileIn.click();}};
+fileIn.onchange=function(){ if(fileIn.files[0]) handle(fileIn.files[0]); };
+['dragenter','dragover'].forEach(function(ev){
+  drop.addEventListener(ev,function(e){e.preventDefault();drop.classList.add('hot');});
+});
+['dragleave','drop'].forEach(function(ev){
+  drop.addEventListener(ev,function(e){e.preventDefault();drop.classList.remove('hot');});
+});
+drop.addEventListener('drop',function(e){
+  if(e.dataTransfer.files[0]) handle(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
